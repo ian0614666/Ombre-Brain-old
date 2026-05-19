@@ -82,6 +82,8 @@ def load_config(config_path: str = None) -> dict:
             "core_memory_budget": 500,
             "recent_context_budget": 300,
             "recalled_memory_budget": 400,
+            "relationship_weather_budget": 220,
+            "related_memory_budget": 220,
             "semantic_weight": 0.45,
             "keyword_weight": 0.35,
             "importance_weight": 0.1,
@@ -130,6 +132,23 @@ def load_config(config_path: str = None) -> dict:
                 "session_defensiveness": 0.12,
                 "residue": "",
             },
+        },
+        "reflection": {
+            "enabled": True,
+            "auto_enabled": True,
+            "enrich_on_write": True,
+            "base_url": "",
+            "model": "",
+            "api_key": "",
+            "thinking_mode": "",
+            "temperature": 0.1,
+            "max_tokens": 700,
+            "timezone": "Asia/Shanghai",
+            "daily_hour": 4,
+            "weekly_day": 0,
+            "weekly_hour": 4,
+            "check_interval_minutes": 60,
+            "edge_min_confidence": 0.55,
         },
     }
 
@@ -250,6 +269,18 @@ def load_config(config_path: str = None) -> dict:
     env_persona_model = os.environ.get("OMBRE_PERSONA_MODEL", "")
     if env_persona_model:
         config.setdefault("persona", {})["model"] = env_persona_model
+
+    env_reflection_api_key = os.environ.get("OMBRE_REFLECTION_API_KEY", "")
+    if env_reflection_api_key:
+        config.setdefault("reflection", {})["api_key"] = env_reflection_api_key
+
+    env_reflection_base_url = os.environ.get("OMBRE_REFLECTION_BASE_URL", "")
+    if env_reflection_base_url:
+        config.setdefault("reflection", {})["base_url"] = env_reflection_base_url
+
+    env_reflection_model = os.environ.get("OMBRE_REFLECTION_MODEL", "")
+    if env_reflection_model:
+        config.setdefault("reflection", {})["model"] = env_reflection_model
 
     # --- Ensure bucket storage directories exist ---
     # --- 确保记忆桶存储目录存在 ---

@@ -120,6 +120,9 @@ class BucketManager:
         anchor: bool = False,
         resolved: bool = False,
         digested: bool = False,
+        confidence: float | None = None,
+        period: str | None = None,
+        date: str | None = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -158,6 +161,12 @@ class BucketManager:
             "updated_at": updated_at_value,
             "activation_count": 0,
         }
+        if confidence is not None:
+            metadata["confidence"] = max(0.0, min(1.0, float(confidence)))
+        if period:
+            metadata["period"] = str(period)
+        if date:
+            metadata["date"] = str(date)
         if pinned:
             metadata["pinned"] = True
         if protected:
@@ -304,6 +313,12 @@ class BucketManager:
             post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
         if "source" in kwargs:
             post["source"] = str(kwargs["source"])
+        if "confidence" in kwargs:
+            post["confidence"] = max(0.0, min(1.0, float(kwargs["confidence"])))
+        if "period" in kwargs:
+            post["period"] = str(kwargs["period"])
+        if "date" in kwargs:
+            post["date"] = str(kwargs["date"])
 
         # --- Auto-refresh content update time and activation time ---
         # --- 自动刷新内容更新时间与激活时间 ---

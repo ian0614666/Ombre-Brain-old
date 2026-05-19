@@ -148,6 +148,8 @@ gateway:
   core_memory_budget: 500
   recent_context_budget: 300
   recalled_memory_budget: 400
+  relationship_weather_budget: 220
+  related_memory_budget: 220
   semantic_weight: 0.45
   keyword_weight: 0.35
   importance_weight: 0.10
@@ -155,6 +157,7 @@ gateway:
   first_card_min_score: 0.55
   second_card_min_score: 0.50
   second_card_relative_score: 0.85
+  edge_min_confidence: 0.55
   # Env vars:
   #   OMBRE_GATEWAY_TOKEN
   #   OMBRE_GATEWAY_UPSTREAM_API_KEY
@@ -210,6 +213,29 @@ persona:
   #   OMBRE_PERSONA_API_KEY
   #   OMBRE_PERSONA_BASE_URL
   #   OMBRE_PERSONA_MODEL
+
+# --- Reflection worker / 关系天气与记忆关系 ---
+# Defaults to persona model config. Set these only when reflection should use a separate model/key.
+reflection:
+  enabled: true
+  auto_enabled: true
+  enrich_on_write: true
+  base_url: ""                    # empty = persona.base_url
+  model: ""                       # empty = persona.model
+  thinking_mode: ""               # empty = persona.thinking_mode
+  # api_key: ""                   # empty = persona.api_key; OMBRE_REFLECTION_API_KEY overrides
+  temperature: 0.1
+  max_tokens: 700
+  timezone: "Asia/Shanghai"
+  daily_hour: 4                   # generate daily impression after this local hour
+  weekly_day: 0                   # 0=Monday, 6=Sunday; auto run writes the previous week
+  weekly_hour: 4
+  check_interval_minutes: 60
+  edge_min_confidence: 0.55
+  # Env vars:
+  #   OMBRE_REFLECTION_API_KEY
+  #   OMBRE_REFLECTION_BASE_URL
+  #   OMBRE_REFLECTION_MODEL
 
 # --- Scoring weights / 检索权重参数 ---
 # total = topic(×4) + emotion(×2) + time(×1.5) + importance(×1)

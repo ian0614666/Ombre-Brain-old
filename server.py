@@ -10,8 +10,8 @@
 # 核心职责：
 #   - Initialize config, bucket manager, dehydrator, decay engine
 #     初始化配置、记忆桶管理器、脱水器、衰减引擎
-#   - Expose 5 MCP tools:
-#     暴露 5 个 MCP 工具：
+#   - Expose MCP tools:
+#     暴露 MCP 工具：
 #       breath — Surface unresolved memories or search by keyword
 #                浮现未解决记忆 或 按关键词检索
 #       hold   — Store a single memory
@@ -22,6 +22,8 @@
 #                修改元数据 / resolved 标记 / 删除
 #       pulse  — System status + bucket listing
 #                系统状态 + 所有桶列表
+#       reflect — Daily/weekly relationship weather
+#                 日/周关系天气
 #
 # Startup:
 # 启动方式：
@@ -56,7 +58,9 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
+from memory_edges import MemoryEdgeStore
 from persona_engine import PersonaStateEngine
+from reflection_engine import ReflectionEngine
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
@@ -73,6 +77,8 @@ decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引�
 embedding_engine = EmbeddingEngine(config)            # Embedding engine / 向量化引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 persona_engine = PersonaStateEngine(config)           # Persona state engine / 人格状态引擎
+memory_edge_store = MemoryEdgeStore(config)            # Explicit memory relationship edges / 显式记忆关系边
+reflection_engine = ReflectionEngine(config)           # Reflection worker / 关系天气与关系整理
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -305,6 +311,9 @@ def _bucket_read_payload(bucket: dict) -> dict:
         "digested",
         "anchor",
         "source",
+        "confidence",
+        "period",
+        "date",
         "created",
         "updated_at",
         "last_active",
@@ -316,6 +325,24 @@ def _bucket_read_payload(bucket: dict) -> dict:
         "content": strip_wikilinks(bucket.get("content", "")),
         "score": decay_engine.calculate_score(meta),
     }
+
+
+def _queue_memory_enrichment(bucket_id: str) -> None:
+    if not bucket_id:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(_enrich_memory_async(bucket_id))
+
+
+async def _enrich_memory_async(bucket_id: str) -> None:
+    try:
+        result = await reflection_engine.enrich_bucket(bucket_id, bucket_mgr, memory_edge_store)
+        logger.debug("Memory enrichment complete / 记忆关系补全完成: %s", result)
+    except Exception as e:
+        logger.warning("Memory enrichment failed / 记忆关系补全失败: %s: %s", bucket_id, e)
 
 
 # =============================================================
@@ -390,6 +417,13 @@ async def health_check(request):
             "status": "ok",
             "buckets": stats["permanent_count"] + stats["dynamic_count"],
             "decay_engine": "running" if decay_engine.is_running else "stopped",
+            "memory_edges": len(memory_edge_store.list_edges()),
+            "reflection": {
+                "enabled": reflection_engine.enabled,
+                "auto_enabled": reflection_engine.auto_enabled,
+                "model": reflection_engine.model,
+                "api_ready": bool(reflection_engine.api_key),
+            },
         })
     except Exception as e:
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
@@ -500,12 +534,12 @@ async def _merge_or_create(
     valence: float,
     arousal: float,
     name: str = "",
-) -> tuple[str, bool]:
+) -> tuple[str, str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
-    Returns (bucket_id_or_name, is_merged).
+    Returns (bucket_id, display_name, is_merged).
     检查是否有相似桶可合并，有则合并，无则新建。
-    返回 (桶ID或名称, 是否合并)。
+    返回 (桶ID, 显示名称, 是否合并)。
     """
     try:
         existing = await bucket_mgr.search(
@@ -547,7 +581,7 @@ async def _merge_or_create(
                     await embedding_engine.generate_and_store(bucket["id"], merged)
                 except Exception:
                     pass
-                return bucket["metadata"].get("name", bucket["id"]), True
+                return bucket["id"], bucket["metadata"].get("name", bucket["id"]), True
             except Exception as e:
                 logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
 
@@ -565,7 +599,7 @@ async def _merge_or_create(
         await embedding_engine.generate_and_store(bucket_id, content)
     except Exception:
         pass
-    return bucket_id, False
+    return bucket_id, name or bucket_id, False
 
 
 # =============================================================
@@ -905,10 +939,11 @@ async def hold(
             await embedding_engine.generate_and_store(bucket_id, content)
         except Exception:
             pass
+        _queue_memory_enrichment(bucket_id)
         return f"📌钉选→{bucket_id} {','.join(domain)}"
 
     # --- Step 2: merge or create / 合并或新建 ---
-    result_name, is_merged = await _merge_or_create(
+    bucket_id, result_name, is_merged = await _merge_or_create(
         content=content,
         tags=all_tags,
         importance=importance,
@@ -917,6 +952,7 @@ async def hold(
         arousal=arousal,
         name=suggested_name,
     )
+    _queue_memory_enrichment(bucket_id)
 
     action = "合并→" if is_merged else "新建→"
     return f"{action}{result_name} {','.join(domain)}"
@@ -949,7 +985,7 @@ async def grow(content: str) -> str:
                 "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
                 "tags": [], "suggested_name": "",
             }
-        result_name, is_merged = await _merge_or_create(
+        bucket_id, result_name, is_merged = await _merge_or_create(
             content=content.strip(),
             tags=analysis.get("tags", []),
             importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
@@ -958,6 +994,7 @@ async def grow(content: str) -> str:
             arousal=analysis.get("arousal", 0.3),
             name=analysis.get("suggested_name", ""),
         )
+        _queue_memory_enrichment(bucket_id)
         action = "合并" if is_merged else "新建"
         return f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
 
@@ -979,7 +1016,7 @@ async def grow(content: str) -> str:
     # --- 逐条合并或新建（单条失败不影响其他）---
     for item in items:
         try:
-            result_name, is_merged = await _merge_or_create(
+            bucket_id, result_name, is_merged = await _merge_or_create(
                 content=item["content"],
                 tags=item.get("tags", []),
                 importance=item.get("importance", 5),
@@ -988,6 +1025,7 @@ async def grow(content: str) -> str:
                 arousal=item.get("arousal", 0.3),
                 name=item.get("name", ""),
             )
+            _queue_memory_enrichment(bucket_id)
 
             if is_merged:
                 results.append(f"📎{result_name}")
@@ -1305,6 +1343,23 @@ async def dream() -> str:
 
 
 # =============================================================
+# Tool 6: reflect — daily / weekly relationship weather
+# 工具 6：reflect — 生成日印象 / 周印象
+# =============================================================
+@mcp.tool()
+async def reflect(period: str = "daily", force: bool = False) -> dict:
+    """生成 daily/weekly relationship_weather feel。默认复用 persona model key；force=True 会重写同周期结果。"""
+    await decay_engine.ensure_started()
+    return await reflection_engine.reflect(
+        period=period,
+        bucket_mgr=bucket_mgr,
+        persona_engine=persona_engine,
+        embedding_engine=embedding_engine,
+        force=force,
+    )
+
+
+# =============================================================
 # Dashboard API endpoints (for lightweight Web UI)
 # 仪表板 API（轻量 Web UI 用）
 # =============================================================
@@ -1347,6 +1402,7 @@ async def api_create_memory(request):
     importance = _int_between(body.get("importance"), 5)
     valence = _float_between(body.get("valence"), 0.5)
     arousal = _float_between(body.get("arousal"), 0.5)
+    confidence = _float_between(body.get("confidence"), 0.5)
     pinned = _bool_value(body.get("pinned"), False)
     protected = _bool_value(body.get("protected"), False)
     anchor = _bool_value(body.get("anchor"), False)
@@ -1368,6 +1424,7 @@ async def api_create_memory(request):
             pinned=pinned,
             anchor=anchor,
             digested=digested,
+            confidence=confidence,
             source="chatgpt",
             last_active=str(body.get("last_active") or now),
             updated_at=str(body.get("updated_at") or now),
@@ -1390,6 +1447,7 @@ async def api_create_memory(request):
             anchor=anchor,
             resolved=resolved,
             digested=digested,
+            confidence=confidence,
             bucket_id=bucket_id,
             source="chatgpt",
             created=str(body.get("created") or now),
@@ -1402,6 +1460,9 @@ async def api_create_memory(request):
         embedding_status = "stored" if await embedding_engine.generate_and_store(bucket_id, content) else "failed"
     else:
         embedding_status = "disabled"
+
+    if bucket_type != "feel":
+        _queue_memory_enrichment(bucket_id)
 
     return JSONResponse({
         "status": status,
@@ -1433,10 +1494,13 @@ async def api_buckets(request):
                 "arousal": meta.get("arousal", 0.3),
                 "model_valence": meta.get("model_valence"),
                 "importance": meta.get("importance", 5),
+                "confidence": meta.get("confidence", 0.5),
                 "resolved": meta.get("resolved", False),
                 "pinned": meta.get("pinned", False),
                 "anchor": meta.get("anchor", False),
                 "digested": meta.get("digested", False),
+                "period": meta.get("period"),
+                "date": meta.get("date"),
                 "created": meta.get("created", ""),
                 "last_active": meta.get("last_active", ""),
                 "activation_count": meta.get("activation_count", 0),
@@ -1523,6 +1587,8 @@ async def api_network(request):
                 "valence": meta.get("valence", 0.5),
                 "arousal": meta.get("arousal", 0.3),
                 "score": decay_engine.calculate_score(meta),
+                "importance": meta.get("importance", 5),
+                "confidence": meta.get("confidence", 0.5),
                 "resolved": meta.get("resolved", False),
                 "pinned": meta.get("pinned", False),
                 "anchor": meta.get("anchor", False),
@@ -1533,17 +1599,45 @@ async def api_network(request):
                 if emb is not None:
                     embeddings[bid] = emb
 
-        # Build edges from embeddings (similarity > 0.5)
+        # Build soft edges from embeddings (higher threshold to avoid hairball graphs)
         ids = list(embeddings.keys())
         for i, id_a in enumerate(ids):
             for id_b in ids[i+1:]:
                 sim = embedding_engine._cosine_similarity(embeddings[id_a], embeddings[id_b])
-                if sim > 0.5:
-                    edges.append({"source": id_a, "target": id_b, "similarity": round(sim, 3)})
+                if sim > 0.72:
+                    edges.append({
+                        "source": id_a,
+                        "target": id_b,
+                        "similarity": round(sim, 3),
+                        "kind": "similarity",
+                    })
+
+        node_ids = {node["id"] for node in nodes}
+        for edge in memory_edge_store.list_edges():
+            if edge["source"] in node_ids and edge["target"] in node_ids:
+                edges.append({
+                    "source": edge["source"],
+                    "target": edge["target"],
+                    "similarity": edge["confidence"],
+                    "kind": "memory_edge",
+                    "relation_type": edge["relation_type"],
+                    "confidence": edge["confidence"],
+                    "reason": edge["reason"],
+                })
 
         return JSONResponse({"nodes": nodes, "edges": edges})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/edges", methods=["GET"])
+async def api_edges(request):
+    """List explicit memory edges."""
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    return JSONResponse({"edges": memory_edge_store.list_edges()})
 
 
 @mcp.custom_route("/api/breath-debug", methods=["GET"])
@@ -1625,6 +1719,33 @@ async def api_breath_debug(request):
             "results": results[:50],  # top 50 for debug
         })
     except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reflection/run", methods=["POST"])
+async def api_reflection_run(request):
+    """Run daily/weekly reflection from dashboard or trusted local callers."""
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    try:
+        result = await reflection_engine.reflect(
+            period=str(body.get("period") or "daily"),
+            bucket_mgr=bucket_mgr,
+            persona_engine=persona_engine,
+            embedding_engine=embedding_engine,
+            force=_bool_value(body.get("force"), False),
+        )
+        return JSONResponse(result)
+    except Exception as e:
+        logger.warning("Reflection API failed: %s", e)
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -2052,6 +2173,34 @@ if __name__ == "__main__":
 
         t = threading.Thread(target=_start_keepalive, daemon=True)
         t.start()
+
+        async def _reflection_loop():
+            await asyncio.sleep(20)
+            local_bucket_mgr = BucketManager(config)
+            local_embedding_engine = EmbeddingEngine(config)
+            local_persona_engine = PersonaStateEngine(config)
+            local_reflection_engine = ReflectionEngine(config)
+            while True:
+                try:
+                    results = await local_reflection_engine.run_due(
+                        local_bucket_mgr,
+                        local_persona_engine,
+                        local_embedding_engine,
+                    )
+                    if results:
+                        logger.info("Reflection run-due results / 反思定时结果: %s", results)
+                except Exception as e:
+                    logger.warning("Reflection scheduler failed / 反思定时器失败: %s", e)
+                await asyncio.sleep(local_reflection_engine.check_interval_minutes * 60)
+
+        def _start_reflection_scheduler():
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(_reflection_loop())
+
+        if reflection_engine.enabled and reflection_engine.auto_enabled:
+            rt = threading.Thread(target=_start_reflection_scheduler, daemon=True)
+            rt.start()
+            logger.info("Reflection scheduler enabled / 反思定时器已启用")
 
         # --- Add CORS middleware so remote clients (Cloudflare Tunnel / ngrok) can connect ---
         # --- 添加 CORS 中间件，让远程客户端（Cloudflare Tunnel / ngrok）能正常连接 ---

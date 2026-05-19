@@ -1318,6 +1318,9 @@ async function showDetail(id) {
         '<div class="field"><label>唤醒度</label>A' + (meta.arousal || 0.3).toFixed(2) + '</div>' +
         '<div class="field"><label>模型视角</label>' + (meta.model_valence != null ? 'V' + meta.model_valence.toFixed(2) : '—') + '</div>' +
         '<div class="field"><label>重要度</label>' + (meta.importance || 5) + '/10</div>' +
+        '<div class="field"><label>置信度</label>' + (meta.confidence != null ? meta.confidence.toFixed(2) : '—') + '</div>' +
+        '<div class="field"><label>周期</label>' + (meta.period || '—') + '</div>' +
+        '<div class="field"><label>日期</label>' + (meta.date || '—') + '</div>' +
         '<div class="field"><label>权重分</label>' + b.score.toFixed(4) + '</div>' +
         '<div class="field"><label>激活次数</label>' + (meta.activation_count || 0) + '</div>' +
         '<div class="field"><label>已解决</label>' + (meta.resolved ? '✓' : '—') + '</div>' +
@@ -1430,9 +1433,18 @@ function drawNetwork(ctx, W, H, data) {
     ctx.beginPath();
     ctx.moveTo(a.x, a.y);
     ctx.lineTo(b.x, b.y);
-    ctx.strokeStyle = 'rgba(47, 79, 79, ' + (e.similarity * 0.35) + ')';
-    ctx.lineWidth = Math.max(0.5, e.similarity * 2);
+    var isMemoryEdge = e.kind === 'memory_edge';
+    ctx.strokeStyle = isMemoryEdge
+      ? 'rgba(154, 123, 79, 0.72)'
+      : 'rgba(47, 79, 79, ' + ((e.similarity || 0.5) * 0.18) + ')';
+    ctx.lineWidth = isMemoryEdge ? 2.2 : Math.max(0.4, (e.similarity || 0.5) * 1.2);
     ctx.stroke();
+    if (isMemoryEdge && e.relation_type) {
+      ctx.fillStyle = '#9A7B4F';
+      ctx.font = '10px Inter, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(e.relation_type, (a.x + b.x) / 2, (a.y + b.y) / 2);
+    }
   });
 
   var colors = { dynamic: '#2F4F4F', permanent: '#9A7B4F', feel: '#8B6A6A', archived: '#B0A590' };
@@ -1462,11 +1474,14 @@ function drawNetwork(ctx, W, H, data) {
       ctx.stroke();
     }
 
-    var name = n.name.length > 10 ? n.name.slice(0, 10) + '…' : n.name;
-    ctx.fillStyle = '#3A3530';
-    ctx.font = '11px Inter, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(name, p.x, p.y + r + 14);
+    var degree = (edgeMap[n.id] || []).length;
+    if (nodes.length <= 45 || n.pinned || n.anchor || n.type === 'feel' || degree >= 2) {
+      var name = n.name.length > 10 ? n.name.slice(0, 10) + '…' : n.name;
+      ctx.fillStyle = '#3A3530';
+      ctx.font = '11px Inter, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(name, p.x, p.y + r + 14);
+    }
   });
 }
 

@@ -21,6 +21,7 @@ from bucket_manager import BucketManager
 from dehydrator import Dehydrator
 from embedding_engine import EmbeddingEngine
 from gateway_state import GatewayStateStore
+from memory_edges import MemoryEdgeStore
 from persona_engine import PersonaStateEngine
 from utils import count_tokens_approx, load_config, setup_logging, strip_wikilinks
 
@@ -48,6 +49,7 @@ class GatewayService:
         self.bucket_mgr = bucket_mgr or BucketManager(config)
         self.dehydrator = dehydrator or Dehydrator(config)
         self.embedding_engine = embedding_engine or EmbeddingEngine(config)
+        self.memory_edge_store = MemoryEdgeStore(config)
         self.state_store = state_store or GatewayStateStore(
             os.path.join(config["buckets_dir"], "gateway_state.db")
         )
@@ -80,6 +82,8 @@ class GatewayService:
         self.core_budget = int(self.gateway_cfg.get("core_memory_budget", 500))
         self.recent_budget = int(self.gateway_cfg.get("recent_context_budget", 300))
         self.recalled_budget = int(self.gateway_cfg.get("recalled_memory_budget", 400))
+        self.relationship_weather_budget = int(self.gateway_cfg.get("relationship_weather_budget", 220))
+        self.related_memory_budget = int(self.gateway_cfg.get("related_memory_budget", 220))
 
         self.semantic_weight = float(self.gateway_cfg.get("semantic_weight", 0.45))
         self.keyword_weight = float(self.gateway_cfg.get("keyword_weight", 0.35))
@@ -90,6 +94,7 @@ class GatewayService:
         self.second_card_relative_score = float(
             self.gateway_cfg.get("second_card_relative_score", 0.85)
         )
+        self.edge_min_confidence = float(self.gateway_cfg.get("edge_min_confidence", 0.55))
         self.pending_tool_reasoning: dict[str, dict[tuple[str, ...], dict[str, Any]]] = {}
 
         self.http_client = http_client or httpx.AsyncClient(timeout=60.0)
@@ -328,11 +333,15 @@ class GatewayService:
         recent_context = await self._build_recent_context_block(all_buckets)
         recalled_buckets = await self._select_dynamic_buckets(query, session_id, all_buckets)
         recalled_memory = await self._summarize_buckets(recalled_buckets, self.recalled_budget)
+        relationship_weather = await self._build_relationship_weather_block(all_buckets)
+        related_memory = await self._build_related_memory_block(recalled_buckets, all_buckets)
         stable_context, dynamic_context = self._build_injected_context_messages(
             persona_block=persona_block,
             core_memory=core_memory,
             recent_context=recent_context,
             recalled_memory=recalled_memory,
+            relationship_weather=relationship_weather,
+            related_memory=related_memory,
         )
 
         forward_payload = deepcopy(payload)
@@ -1374,6 +1383,96 @@ class GatewayService:
         )
         return await self._summarize_buckets(recent_buckets[:6], self.recent_budget)
 
+    async def _build_relationship_weather_block(self, all_buckets: list[dict]) -> str:
+        if self.relationship_weather_budget <= 0:
+            return ""
+        weather_buckets = []
+        for bucket in all_buckets:
+            meta = bucket.get("metadata", {})
+            if meta.get("type") != "feel":
+                continue
+            tags = {str(tag) for tag in meta.get("tags", [])}
+            if not ({"relationship_weather", "daily_impression", "weekly_impression"} & tags):
+                continue
+            weather_buckets.append(bucket)
+        if not weather_buckets:
+            return ""
+
+        daily = [
+            bucket for bucket in weather_buckets
+            if "daily_impression" in {str(tag) for tag in bucket.get("metadata", {}).get("tags", [])}
+        ]
+        weekly = [
+            bucket for bucket in weather_buckets
+            if "weekly_impression" in {str(tag) for tag in bucket.get("metadata", {}).get("tags", [])}
+        ]
+        daily.sort(key=lambda bucket: bucket.get("metadata", {}).get("created", ""), reverse=True)
+        weekly.sort(key=lambda bucket: bucket.get("metadata", {}).get("created", ""), reverse=True)
+        selected = weekly[:1] + daily[:7]
+
+        remaining = self.relationship_weather_budget
+        parts = []
+        for bucket in selected:
+            meta = bucket.get("metadata", {})
+            text = strip_wikilinks(bucket.get("content", "")).strip()
+            if not text:
+                continue
+            prefix = meta.get("date") or meta.get("created", "")[:10]
+            line = f"- [{prefix}] {self._trim_text(text, 80)}"
+            tokens = count_tokens_approx(line)
+            if tokens > remaining and parts:
+                break
+            parts.append(line)
+            remaining -= tokens
+            if remaining <= 0:
+                break
+        return "\n".join(parts)
+
+    async def _build_related_memory_block(
+        self,
+        recalled_buckets: list[dict],
+        all_buckets: list[dict],
+    ) -> str:
+        if self.related_memory_budget <= 0 or not recalled_buckets:
+            return ""
+        recalled_ids = [bucket["id"] for bucket in recalled_buckets if bucket.get("id")]
+        edges = self.memory_edge_store.related_edges(
+            recalled_ids,
+            min_confidence=self.edge_min_confidence,
+            limit_per_source=1,
+        )
+        if not edges:
+            return ""
+        bucket_map = {bucket["id"]: bucket for bucket in all_buckets}
+        recalled_set = set(recalled_ids)
+        remaining = self.related_memory_budget
+        parts = []
+        for edge in edges:
+            target_id = edge.get("target")
+            if target_id in recalled_set:
+                continue
+            target = bucket_map.get(target_id)
+            if not target:
+                continue
+            summary = await self._summarize_bucket(target)
+            reason = edge.get("reason") or edge.get("relation_type", "relates_to")
+            line = (
+                f"- {edge.get('source')} -> {target_id} "
+                f"[{edge.get('relation_type')}, confidence={edge.get('confidence')}] "
+                f"{reason}\n  {summary}"
+            )
+            tokens = count_tokens_approx(line)
+            if tokens > remaining and parts:
+                break
+            if tokens > remaining:
+                line = self._trim_text(line, remaining)
+                tokens = count_tokens_approx(line)
+            parts.append(line)
+            remaining -= tokens
+            if remaining <= 0:
+                break
+        return "\n".join(parts)
+
     async def _select_dynamic_buckets(
         self,
         query: str,
@@ -1524,6 +1623,8 @@ class GatewayService:
         core_memory: str,
         recent_context: str,
         recalled_memory: str,
+        relationship_weather: str,
+        related_memory: str,
     ) -> tuple[str, str]:
         stable_sections = [
             "Use the following private memory only when it fits naturally. "
@@ -1537,11 +1638,17 @@ class GatewayService:
             "",
             persona_block,
             "",
+            "Relationship Weather",
+            relationship_weather or "(none)",
+            "",
             "Recent Context",
             recent_context or "(none)",
             "",
             "Recalled Memory",
             recalled_memory or "(none)",
+            "",
+            "Related Memory",
+            related_memory or "(none)",
         ]
         stable_context = "\n".join(stable_sections).strip()
         dynamic_context = "\n".join(dynamic_sections).strip()

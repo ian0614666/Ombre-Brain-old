@@ -935,7 +935,7 @@ breath(query="今天很累")
     返回 ≤20 条结果
 ```
 
-7 个 MCP 工具 / 7 MCP tools:
+8 个 MCP 工具 / 8 MCP tools:
 
 | 工具 Tool | 作用 Purpose |
 |-----------|-------------|
@@ -946,6 +946,7 @@ breath(query="今天很累")
 | `trace` | 修改元数据、标记已解决、删除；`anchor=1` 标为长期锚点，默认最多 24 条且需放置一段时间后再标 / Modify metadata, mark resolved, anchor, or delete |
 | `pulse` | 系统状态 + 所有记忆桶列表 / System status + bucket listing |
 | `dream` | 对话开头自省消化——读最近记忆，有沉淀写 feel，能放下就 resolve / Self-reflection at conversation start |
+| `reflect` | 生成日印象 / 周印象 relationship_weather feel；服务端定时器也调用同一逻辑 / Generate daily or weekly relationship-weather feels |
 
 ## 安装 / Setup
 
@@ -1170,12 +1171,61 @@ Feel is not an event log — it's **what the model carries away**: a feeling, an
 - Feel 不参与普通浮现、不衰减、不参与 dreaming
 - 用 `breath(domain="feel")` 读取之前的 feel
 
+### Relationship Weather / Memory Edge
+
+`reflect(period="daily" | "weekly")` 会生成一条 `feel` 类型的关系天气：
+
+- `daily_impression`：当天的关系天气
+- `weekly_impression`：本周的关系天气
+- `relationship_weather`：Gateway 会在醒来时读取这些 feel
+
+Reflection 默认复用 Persona 的模型配置和 key：
+
+```yaml
+reflection:
+  enabled: true
+  auto_enabled: true
+  base_url: ""   # empty = persona.base_url
+  model: ""      # empty = persona.model
+  # api_key empty = persona.api_key
+```
+
+也可以用环境变量单独覆盖：
+
+```bash
+OMBRE_REFLECTION_API_KEY=...
+OMBRE_REFLECTION_BASE_URL=...
+OMBRE_REFLECTION_MODEL=...
+```
+
+写入普通记忆后，reflection worker 会异步补轻量分类和关系边。关系边存放在 `state/memory_edges.jsonl`：
+
+```json
+{
+  "source": "memory-a",
+  "target": "memory-b",
+  "relation_type": "updates",
+  "confidence": 0.82,
+  "reason": "新记忆补充了旧记忆的后续结果",
+  "created_at": "2026-05-19T..."
+}
+```
+
+支持的关系类型：`triggers / causes / updates / contradicts / supports / promises / blocks / belongs_to / emotional_echo / relates_to`。
+
+Gateway 现在会额外注入：
+
+- 最近的 relationship weather
+- 每条召回记忆的一跳强关系边
+- 关系边指向的相关记忆摘要
+
 ### 对话启动完整流程 / Conversation Start Sequence
 ```
 1. breath()              — 睁眼，看有什么浮上来
 2. dream()               — 消化最近记忆，有沉淀写 feel
-3. breath(domain="feel") — 读之前的 feel
-4. 开始和用户说话
+3. reflect()             — 自动或手动生成日/周关系天气
+4. breath(domain="feel") — 读之前的 feel
+5. 开始和用户说话
 ```
 
 ## 给 Claude 的使用指南 / Usage Guide for Claude
@@ -1213,7 +1263,7 @@ SUPABASE_SERVICE_KEY=xxx python scripts/sync_to_supabase.py --apply
 ```
 
 C 端写入 Supabase 时，记录必须带稳定唯一 `id`，并把 `source` 写成 `chatgpt`。Ombre 本地已有的记录会优先写回原文件路径，新记录会写成 `类型/主题/标题_id.md`。
-同步判断只比较内容字段和 `updated_at`：`content/name/tags/domain/pinned/resolved/digested/importance/source` 参与同步；`last_active/activation_count` 是 VPS 本地运行时字段，普通召回刷新它们时不会推回 Supabase；`synced_at` 只表示同步脚本成功处理的时间。
+同步判断只比较内容字段和 `updated_at`：`content/name/tags/domain/pinned/resolved/digested/importance/source` 参与同步；`last_active/activation_count` 是 VPS 本地运行时字段，普通召回刷新它们时不会推回 Supabase；`synced_at` 只表示同步脚本成功处理的时间。`confidence/period/date` 先保存在本地 bucket 元数据里，Supabase 表结构扩展后再加入同步字段。
 
 删除用墓碑记录。MCP 删除本地 bucket 后，会在 `.tombstones/<bucket_id>.json` 留一条记录；同步脚本会把它推到 Supabase，形态是 `source=deleted`。下一次如果 Supabase 或本地又出现同 id 的旧文件，脚本会按墓碑删除本地旧文件，避免旧记忆重新出现。
 

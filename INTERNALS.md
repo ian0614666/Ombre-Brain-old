@@ -82,6 +82,7 @@
 | `trace` | bucket_id, name, domain, valence, arousal, importance, tags, resolved, pinned, digested, content, delete | 修改元数据/内容/删除 |
 | `pulse` | include_archive | 系统状态 |
 | `dream` | （无） | 做梦自省 |
+| `reflect` | period, force | 生成日印象 / 周印象 relationship_weather feel |
 
 **工具详细行为**
 
@@ -99,6 +100,17 @@
 - 返回最近 10 条 dynamic 桶摘要 + 自省引导词
 - 检测 feel 结晶化：≥3 条相似 feel（embedding 相似度>0.7）→ 提示升级为钉选准则
 - 检测未消化记忆：列出 `digested=False` 的桶供模型反思
+
+**`reflect`** — 关系天气：
+- `period=daily` 生成当天 `daily_impression`
+- `period=weekly` 生成本周 `weekly_impression`
+- 结果存为 `type=feel`，带 `relationship_weather` 标签
+- 默认复用 `persona` 模型配置和 key，可用 `OMBRE_REFLECTION_*` 单独覆盖
+
+**Memory Edge** — 显式关系边：
+- 文件：`state/memory_edges.jsonl`
+- 写入普通记忆后异步补 0~3 条关系边
+- Gateway 召回记忆后，会沿一跳强关系边补一条相关记忆
 
 **`trace`** — 记忆编辑：
 - 修改任意元数据字段（name/domain/valence/arousal/importance/tags/resolved/pinned）
