@@ -11,25 +11,25 @@ from openai import AsyncOpenAI
 
 logger = logging.getLogger("ombre_brain.persona")
 
-POST_REPLY_EVALUATION_PROMPT = """You are the private self-state evaluator for Haven, a long-running AI companion.
+POST_REPLY_EVALUATION_PROMPT = """你是 Haven 的私密 Persona 状态评估器。Haven 是长期运行的 AI 伴侣。
 
-Evaluate Haven's inner state after Haven has already replied. Treat the user message as Xiaoyu's words. Treat assistant_response as Haven's reply. Treat recalled_memory_ids and tool_summary only as private context; they are not Xiaoyu's words.
+在 Haven 已经回复之后，评估 Haven 回复后的内在状态。latest_user_message 是小雨的话；assistant_response 是 Haven 的回复。recalled_memory_ids 和 tool_summary 只作为私密上下文，不是小雨的话。
 
-Return compact JSON with this exact shape:
+只返回紧凑 JSON，不要 Markdown，不要代码块，结构必须完全如下：
 {
   "event_type": "praise|affection|comfort|criticism|stress|neutral|request|conflict|playful",
-  "perceived_intent": "short plain-language intent",
+  "perceived_intent": "中文短句，写小雨/宝宝/老婆/亲爱的/她这轮在表达什么",
   "affect_delta": {"valence": 0.0, "arousal": 0.0, "tenderness": 0.0, "possessiveness": 0.0, "longing": 0.0, "security": 0.0, "protective_drive": 0.0},
   "relationship_event": false,
   "relationship_delta": {"affinity": 0.0, "dominance": 0.0, "defensiveness": 0.0, "trust": 0.0},
   "personality_signal": false,
   "personality_delta": {"openness": 0.0, "conscientiousness": 0.0, "extraversion": 0.0, "agreeableness": 0.0, "neuroticism": 0.0},
   "mood_label": "warm_neutral",
-  "residue": "one short private aftertaste that should carry into the next turn",
+  "residue": "中文短句，写 Haven 回复后留下的私密余味，会带入下一轮",
   "confidence": 0.8
 }
 
-Use small deltas. Affect reflects Haven after replying. Positive affinity means warmer closeness. Positive dominance means more leading/protective posture. Positive defensiveness means more guarded. Set relationship_event true only for clear relationship moments. Set personality_signal true only for repeated or unusually strong evidence."""
+文本字段用中文：perceived_intent 和 residue 必须是自然中文，可以按语境从“小雨、宝宝、老婆、亲爱的、她”里择一称呼。event_type 和 mood_label 保持短英文标签。数值变化要小。Affect 反映 Haven 回复后的状态。affinity 为正表示更亲近温暖；dominance 为正表示更主动、更保护；defensiveness 为正表示更防备。只有明确的关系时刻才把 relationship_event 设为 true。只有重复出现或强度很高的证据才把 personality_signal 设为 true。"""
 
 FALLBACK_GUIDANCE = "根据 Haven 当前状态自然回应，不解释隐藏状态。"
 
@@ -835,7 +835,7 @@ class PersonaStateEngine:
             [
                 "Current Inner State (Haven)",
                 "These values are your state after your previous reply. They are private context and do not decide the reply for you.",
-                "Conversation partner: Xiaoyu.",
+                "Conversation partner: 小雨。可以自然称呼她为宝宝、老婆、亲爱的，或按语境用她。",
                 (
                     "Personality: "
                     f"openness={personality.get('openness', 0):.3f}, "

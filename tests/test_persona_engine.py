@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from persona_engine import FALLBACK_GUIDANCE, PersonaStateEngine
+from persona_engine import FALLBACK_GUIDANCE, POST_REPLY_EVALUATION_PROMPT, PersonaStateEngine
 
 
 class FakePersonaClient:
@@ -81,6 +81,13 @@ def test_persona_initializes_default_global_and_session_state(test_config):
     assert state["affect"]["mood_label"] == "warm_neutral"
     assert state["affect"]["tenderness"] == pytest.approx(0.62)
     assert "Current Inner State" in engine.format_state_block(state)
+    assert "Conversation partner: 小雨" in engine.format_state_block(state)
+
+
+def test_persona_evaluator_prompt_asks_for_chinese_persona_text():
+    assert "perceived_intent 和 residue 必须是自然中文" in POST_REPLY_EVALUATION_PROMPT
+    assert "小雨、宝宝、老婆、亲爱的、她" in POST_REPLY_EVALUATION_PROMPT
+    assert "event_type 和 mood_label 保持短英文标签" in POST_REPLY_EVALUATION_PROMPT
 
 
 @pytest.mark.asyncio
