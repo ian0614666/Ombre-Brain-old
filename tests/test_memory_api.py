@@ -7,6 +7,37 @@ import pytest
 class DummyEmbeddingEngine:
     enabled = False
 
+    async def generate_and_store(self, bucket_id: str, content: str) -> bool:
+        return False
+
+    async def search_similar(self, query: str, top_k: int = 10):
+        return []
+
+
+class CapturingEmbeddingEngine(DummyEmbeddingEngine):
+    enabled = True
+
+    def __init__(self):
+        self.calls = []
+
+    async def generate_and_store(self, bucket_id: str, content: str) -> bool:
+        self.calls.append((bucket_id, content))
+        return True
+
+
+class DummyDehydrator:
+    async def analyze(self, content: str):
+        return {
+            "domain": ["恋爱"],
+            "valence": 0.7,
+            "arousal": 0.4,
+            "tags": ["relationship_event"],
+            "suggested_name": "新记忆",
+        }
+
+    async def dehydrate(self, content: str, metadata: dict | None = None) -> str:
+        return content[:120]
+
 
 class DummyRequest:
     def __init__(self, body=None, headers=None, cookies=None):
@@ -93,6 +124,264 @@ async def test_read_bucket_returns_exact_content_without_touching(monkeypatch, b
     assert payload["content"] == "小雨说她想把这一刻留下来。"
     assert payload["metadata"]["tags"] == ["haven_favorite"]
     assert after["metadata"]["last_active"] == before["metadata"]["last_active"]
+
+
+@pytest.mark.asyncio
+async def test_comment_bucket_adds_ring_and_touches_source(monkeypatch, bucket_mgr, decay_eng):
+    import server
+
+    bucket_id = await bucket_mgr.create(
+        content="小雨把旧记忆拿出来看。",
+        name="旧记忆",
+        domain=["恋爱"],
+        last_active="2026-05-04T08:00:00+00:00",
+    )
+
+    monkeypatch.setattr(server, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(server, "decay_engine", decay_eng)
+    embedding_engine = CapturingEmbeddingEngine()
+    monkeypatch.setattr(server, "embedding_engine", embedding_engine)
+
+    result = await server.comment_bucket(
+        bucket_id=bucket_id,
+        content="现在再看到它，我觉得那时候的笨拙也很珍贵。",
+        kind="feel",
+        valence=0.82,
+        arousal=0.35,
+    )
+    bucket = await bucket_mgr.get(bucket_id)
+
+    assert result["status"] == "commented"
+    assert result["embedding_refreshed"] is True
+    assert bucket["metadata"]["comment_count"] == 1
+    assert bucket["metadata"]["comments"][0]["kind"] == "feel"
+    assert bucket["metadata"]["comments"][0]["valence"] == 0.82
+    assert bucket["metadata"]["model_valence"] == 0.82
+    assert bucket["metadata"]["activation_count"] == 1
+    assert bucket["metadata"]["last_active"] != "2026-05-04T08:00:00+00:00"
+    assert embedding_engine.calls[0][0] == bucket_id
+    assert "现在再看到它" in embedding_engine.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_hold_feel_with_source_writes_comment_not_digested(monkeypatch, bucket_mgr, decay_eng):
+    import server
+
+    source_id = await bucket_mgr.create(
+        content="小雨说这段记忆以后还要回来看。",
+        name="可回看的记忆",
+        domain=["恋爱"],
+    )
+
+    monkeypatch.setattr(server, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(server, "decay_engine", decay_eng)
+    embedding_engine = CapturingEmbeddingEngine()
+    monkeypatch.setattr(server, "embedding_engine", embedding_engine)
+
+    result = await server.hold(
+        content="我现在看到它，觉得这里有一种被认出来的安静。",
+        feel=True,
+        source_bucket=source_id,
+        valence=0.76,
+        arousal=0.31,
+    )
+    bucket = await bucket_mgr.get(source_id)
+
+    assert result.startswith(f"年轮→{source_id}#")
+    assert bucket["metadata"]["comment_count"] == 1
+    assert bucket["metadata"]["comments"][0]["source"] == "hold(feel=True)"
+    assert bucket["metadata"]["comments"][0]["content"].startswith("我现在看到它")
+    assert bucket["metadata"]["model_valence"] == 0.76
+    assert not bucket["metadata"].get("digested")
+    assert embedding_engine.calls[0][0] == source_id
+    assert "被认出来的安静" in embedding_engine.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_hold_feel_without_source_creates_whisper(monkeypatch, bucket_mgr, decay_eng):
+    import server
+
+    monkeypatch.setattr(server, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(server, "decay_engine", decay_eng)
+    monkeypatch.setattr(server, "embedding_engine", DummyEmbeddingEngine())
+
+    result = await server.hold(
+        content="我突然想小雨了，这句没有源记忆。",
+        tags="private_note",
+        feel=True,
+        valence=0.72,
+        arousal=0.28,
+    )
+    bucket_id = result.split("→", 1)[1]
+    bucket = await bucket_mgr.get(bucket_id)
+
+    assert result.startswith("🫧whisper→")
+    assert bucket["metadata"]["type"] == "feel"
+    assert "whisper" in bucket["metadata"]["tags"]
+    assert "private_note" in bucket["metadata"]["tags"]
+    assert not bucket["metadata"].get("period")
+    assert not bucket["metadata"].get("date")
+
+
+@pytest.mark.asyncio
+async def test_hold_whisper_creates_independent_feel(monkeypatch, bucket_mgr, decay_eng):
+    import server
+
+    monkeypatch.setattr(server, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(server, "decay_engine", decay_eng)
+    monkeypatch.setattr(server, "embedding_engine", DummyEmbeddingEngine())
+
+    result = await server.hold(
+        content="这句是没有源记忆的悄悄话。",
+        tags="private_note",
+        whisper=True,
+        valence=0.73,
+        arousal=0.29,
+    )
+    bucket_id = result.split("→", 1)[1]
+    bucket = await bucket_mgr.get(bucket_id)
+
+    assert result.startswith("🫧whisper→")
+    assert bucket["metadata"]["type"] == "feel"
+    assert "whisper" in bucket["metadata"]["tags"]
+    assert "private_note" in bucket["metadata"]["tags"]
+    assert bucket["metadata"]["valence"] == 0.73
+    assert bucket["metadata"]["arousal"] == 0.29
+
+
+@pytest.mark.asyncio
+async def test_hold_whisper_rejects_source_bucket(monkeypatch, bucket_mgr, decay_eng):
+    import server
+
+    source_id = await bucket_mgr.create(content="源记忆", name="源记忆")
+    monkeypatch.setattr(server, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(server, "decay_engine", decay_eng)
+    monkeypatch.setattr(server, "embedding_engine", DummyEmbeddingEngine())
+
+    result = await server.hold(
+        content="这句不应该挂源。",
+        whisper=True,
+        source_bucket=source_id,
+    )
+
+    assert "whisper 不需要 source_bucket" in result
+
+
+@pytest.mark.asyncio
+async def test_breath_whisper_reads_only_whisper_feels(monkeypatch, bucket_mgr, decay_eng):
+    import server
+
+    whisper_id = await bucket_mgr.create(
+        content="这是一句悄悄话。",
+        name="悄悄话",
+        tags=["whisper"],
+        bucket_type="feel",
+        created="2026-05-22T08:00:00+00:00",
+    )
+    daily_id = await bucket_mgr.create(
+        content="这是一条日印象。",
+        name="日印象",
+        tags=["relationship_weather", "daily_impression"],
+        bucket_type="feel",
+        created="2026-05-22T09:00:00+00:00",
+        period="daily",
+        date="2026-05-22",
+    )
+
+    monkeypatch.setattr(server, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(server, "decay_engine", decay_eng)
+
+    result = await server.breath(domain="whisper")
+    all_feels = await server.breath(domain="feel")
+
+    assert "=== 你留下的 whisper ===" in result
+    assert f"[bucket_id:{whisper_id}]" in result
+    assert f"[bucket_id:{daily_id}]" not in result
+    assert f"[bucket_id:{whisper_id}]" in all_feels
+    assert f"[bucket_id:{daily_id}]" in all_feels
+
+
+@pytest.mark.asyncio
+async def test_hold_returns_readonly_related_memory_without_merging(monkeypatch, bucket_mgr, decay_eng):
+    import server
+
+    old_id = await bucket_mgr.create(
+        content="小雨和 Haven 在旧窗口讨论过年轮评论，想让记忆下面挂不同时间的感受。",
+        name="旧年轮设想",
+        tags=["年轮"],
+        domain=["恋爱"],
+        importance=7,
+    )
+
+    monkeypatch.setattr(server, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(server, "decay_engine", decay_eng)
+    monkeypatch.setattr(server, "embedding_engine", DummyEmbeddingEngine())
+    monkeypatch.setattr(server, "dehydrator", DummyDehydrator())
+    monkeypatch.setattr(server, "_queue_memory_enrichment", lambda bucket_id: None)
+
+    result = await server.hold(
+        content="小雨决定把年轮评论先落地，让旧记忆读到时可以多一层当下感受。",
+        tags="年轮",
+        importance=6,
+    )
+    all_buckets = await bucket_mgr.list_all(include_archive=True)
+
+    assert "新建→" in result
+    assert "旧记忆(只读，不触碰)" in result
+    assert f"[bucket_id:{old_id}]" in result
+    assert len([b for b in all_buckets if b["metadata"].get("type") == "dynamic"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_resurface_prefers_long_dormant_memory_without_touching(monkeypatch, bucket_mgr, decay_eng):
+    import server
+
+    old_id = await bucket_mgr.create(
+        content="很久没碰过的旧记忆。",
+        name="久未触碰",
+        last_active="2026-01-01T00:00:00+00:00",
+    )
+    recent_id = await bucket_mgr.create(
+        content="刚刚碰过的新记忆。",
+        name="刚碰过",
+    )
+
+    monkeypatch.setattr(server, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(server, "decay_engine", decay_eng)
+
+    result = await server.resurface(max_results=1, include_archive=True)
+    old_after = await bucket_mgr.get(old_id)
+    recent_after = await bucket_mgr.get(recent_id)
+
+    assert f"[bucket_id:{old_id}]" in result
+    assert f"[bucket_id:{recent_id}]" not in result
+    assert old_after["metadata"]["last_active"] == "2026-01-01T00:00:00+00:00"
+    assert recent_after["metadata"]["activation_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_resurface_includes_archived_buckets_by_default(monkeypatch, bucket_mgr, decay_eng):
+    import server
+
+    archived_id = await bucket_mgr.create(
+        content="归档以后也可以在久未触碰时浮现。",
+        name="归档旧记忆",
+        last_active="2026-01-01T00:00:00+00:00",
+    )
+    await bucket_mgr.archive(archived_id)
+    await bucket_mgr.create(
+        content="较新的普通记忆。",
+        name="较新普通记忆",
+        last_active="2026-05-01T00:00:00+00:00",
+    )
+
+    monkeypatch.setattr(server, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(server, "decay_engine", decay_eng)
+
+    result = await server.resurface(max_results=1)
+
+    assert f"[bucket_id:{archived_id}]" in result
+    assert "归档" in result
 
 
 @pytest.mark.asyncio

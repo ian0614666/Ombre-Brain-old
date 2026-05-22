@@ -186,6 +186,25 @@ async def test_search_appends_related_memory_and_touches_only_matched_bucket(pat
 
 
 @pytest.mark.asyncio
+async def test_search_skips_feel_hits_without_touching(patch_breath):
+    import server
+
+    bucket_mgr = patch_breath(
+        [
+            _bucket("F", "F feel hit", bucket_type="feel", score=10.0),
+            _bucket("A", "A ordinary hit", score=9.0),
+        ],
+        search_ids=["F", "A"],
+    )
+
+    result = await server.breath(query="hit", max_tokens=50, include_related=False)
+
+    assert "[bucket_id:F]" not in result
+    assert "[bucket_id:A]" in result
+    assert bucket_mgr.touched == ["A"]
+
+
+@pytest.mark.asyncio
 async def test_incoming_edge_renders_left_arrow_from_search_source(patch_breath):
     import server
 
@@ -276,7 +295,7 @@ async def test_random_drift_does_not_exceed_remaining_budget(patch_breath, monke
         text = str(text)
         if text.startswith("[bucket_id:A]"):
             return 9
-        if text.startswith("--- 忽然想起来"):
+        if text.startswith("--- 久未碰过"):
             return 2
         return 5
 
@@ -290,10 +309,9 @@ async def test_random_drift_does_not_exceed_remaining_budget(patch_breath, monke
     )
     monkeypatch.setattr(server.random, "random", lambda: 0.0)
     monkeypatch.setattr(server.random, "randint", lambda start, end: 1)
-    monkeypatch.setattr(server.random, "sample", lambda items, count: items[:count])
 
     result = await server.breath(query="A", max_tokens=10, include_related=False)
 
     assert "[bucket_id:A]" in result
-    assert "--- 忽然想起来 ---" not in result
+    assert "--- 久未碰过 ---" not in result
     assert "B low score drift candidate" not in result

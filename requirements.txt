@@ -15,6 +15,9 @@ openai>=1.0.0
 # YAML 配置解析
 pyyaml>=6.0
 
+# Windows 上 zoneinfo 读取 Asia/Shanghai 等 IANA 时区需要 tzdata
+tzdata>=2024.1
+
 # Markdown frontmatter 解析（桶文件读写）
 python-frontmatter>=1.1.0
 

@@ -121,7 +121,7 @@ AFFECT_ANCHOR_HEADER = "### affect_anchor"
 
 
 class ReflectionEngine:
-    """LLM-backed memory enrichment and daily/weekly relationship weather."""
+    """LLM-backed memory enrichment and daily relationship weather."""
 
     def __init__(self, config: dict):
         self.config = config
@@ -152,6 +152,7 @@ class ReflectionEngine:
         except Exception:
             self.tz = ZoneInfo("Asia/Shanghai")
         self.daily_hour = int(cfg.get("daily_hour", 4))
+        self.weekly_enabled = bool(cfg.get("weekly_enabled", False))
         self.weekly_day = int(cfg.get("weekly_day", 0))
         self.weekly_hour = int(cfg.get("weekly_hour", self.daily_hour))
         self.check_interval_minutes = max(5, int(cfg.get("check_interval_minutes", 60)))
@@ -267,6 +268,14 @@ class ReflectionEngine:
                 "diary_memory": {"status": "not_applicable", "reason": "reflection_disabled"},
             }
         period = self._normalize_period(period)
+        if period == "weekly" and not self.weekly_enabled:
+            return {
+                "status": "skipped",
+                "reason": "weekly_disabled",
+                "period": period,
+                "diary": {"found": False},
+                "diary_memory": {"status": "not_applicable", "reason": "weekly_disabled"},
+            }
         now_local = self._local_now(now)
         key = self._period_key(period, now_local)
         bucket_id = f"reflection_{period}_{key}"
@@ -399,7 +408,7 @@ class ReflectionEngine:
             results.append(
                 await self.reflect("daily", bucket_mgr, persona_engine, embedding_engine, force=False, now=daily_target)
             )
-        if now_local.weekday() == self.weekly_day and now_local.hour >= self.weekly_hour:
+        if self.weekly_enabled and now_local.weekday() == self.weekly_day and now_local.hour >= self.weekly_hour:
             weekly_target = now_local - timedelta(days=1)
             results.append(
                 await self.reflect("weekly", bucket_mgr, persona_engine, embedding_engine, force=False, now=weekly_target)

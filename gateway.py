@@ -27,6 +27,7 @@ from persona_engine import PersonaStateEngine
 from utils import count_tokens_approx, load_config, setup_logging, strip_wikilinks
 
 logger = logging.getLogger("ombre_brain.gateway")
+FAVORITE_MEMORY_MARKER = "[[ombre:favorite]]"
 
 
 class GatewayService:
@@ -84,6 +85,9 @@ class GatewayService:
         self.recent_budget = int(self.gateway_cfg.get("recent_context_budget", 300))
         self.recalled_budget = int(self.gateway_cfg.get("recalled_memory_budget", 400))
         self.relationship_weather_budget = int(self.gateway_cfg.get("relationship_weather_budget", 220))
+        self.relationship_weather_include_weekly = bool(
+            self.gateway_cfg.get("relationship_weather_include_weekly", False)
+        )
         self.favorite_memory_budget = int(self.gateway_cfg.get("favorite_memory_budget", 180))
         self.favorite_memory_max_cards = max(0, int(self.gateway_cfg.get("favorite_memory_max_cards", 1)))
         self.related_memory_budget = int(self.gateway_cfg.get("related_memory_budget", 220))
@@ -204,8 +208,16 @@ class GatewayService:
         )
 
         try:
+            payload, marker_favorite = self._strip_favorite_memory_marker_from_payload(payload)
+            include_favorite_memory = marker_favorite or self._truthy_header(
+                request.headers.get("X-Ombre-Include-Favorite-Memory")
+            )
             persona_user_message = self._extract_last_user_query(payload.get("messages", []))
-            forward_payload, recalled_ids = await self.prepare_payload(payload, session_id)
+            forward_payload, recalled_ids = await self.prepare_payload(
+                payload,
+                session_id,
+                include_favorite_memory=include_favorite_memory,
+            )
         except ValueError as exc:
             return JSONResponse(
                 {"error": {"message": str(exc), "type": "invalid_request_error"}},
@@ -278,8 +290,16 @@ class GatewayService:
         )
 
         try:
+            openai_payload, marker_favorite = self._strip_favorite_memory_marker_from_payload(openai_payload)
+            include_favorite_memory = marker_favorite or self._truthy_header(
+                request.headers.get("X-Ombre-Include-Favorite-Memory")
+            )
             persona_user_message = self._extract_last_user_query(openai_payload.get("messages", []))
-            forward_payload, recalled_ids = await self.prepare_payload(openai_payload, session_id)
+            forward_payload, recalled_ids = await self.prepare_payload(
+                openai_payload,
+                session_id,
+                include_favorite_memory=include_favorite_memory,
+            )
         except ValueError as exc:
             return self._anthropic_error(str(exc), status_code=400)
         except RuntimeError as exc:
@@ -333,7 +353,13 @@ class GatewayService:
             }
         )
 
-    async def prepare_payload(self, payload: dict, session_id: str) -> tuple[dict, list[str] | None]:
+    async def prepare_payload(
+        self,
+        payload: dict,
+        session_id: str,
+        *,
+        include_favorite_memory: bool = False,
+    ) -> tuple[dict, list[str] | None]:
         messages = payload.get("messages")
         if not isinstance(messages, list) or not messages:
             raise ValueError("messages must be a non-empty list")
@@ -371,7 +397,11 @@ class GatewayService:
             recalled_memory = await self._summarize_buckets(recalled_buckets, self.recalled_budget)
             if self._should_inject_interval(session_id, self.relationship_weather_interval_rounds):
                 relationship_weather = await self._build_relationship_weather_block(all_buckets)
-            if self._should_inject_interval(session_id, self.favorite_memory_interval_rounds):
+            if (
+                include_favorite_memory
+                or self._query_requests_favorite_memory(current_user_query)
+                or self._should_inject_interval(session_id, self.favorite_memory_interval_rounds)
+            ):
                 favorite_memory, favorite_ids = await self._build_favorite_memory_block(all_buckets, session_id)
             related_memory = await self._build_related_memory_block(recalled_buckets, all_buckets)
             injected_ids = list(
@@ -1489,6 +1519,84 @@ class GatewayService:
         next_round = self.state_store.get_current_round(session_id) + 1
         return next_round == 1 or next_round % interval_rounds == 0
 
+    def _query_requests_favorite_memory(self, query: str) -> bool:
+        text = (query or "").strip().lower()
+        if not text:
+            return False
+        direct_phrases = [
+            "favorite memory",
+            "favorite memories",
+            "haven favorite",
+            "偏爱的记忆",
+            "喜欢的记忆",
+            "喜欢哪段记忆",
+            "最喜欢哪段",
+            "最偏爱",
+            "哪段记忆最",
+            "记忆里最",
+            "哪一刻最",
+            "哪个瞬间最",
+            "想起我们什么",
+            "想起了我们什么",
+            "我们哪段",
+            "我们哪一刻",
+            "我们哪个瞬间",
+        ]
+        if any(phrase in text for phrase in direct_phrases):
+            return True
+        asks_memory = any(term in text for term in ["记忆", "想起", "记得"])
+        asks_preference = any(term in text for term in ["喜欢", "偏爱", "重要", "哪段", "哪一刻", "哪个瞬间"])
+        relationship_scope = any(term in text for term in ["我们", "你", "haven", "小雨"])
+        return asks_memory and asks_preference and relationship_scope
+
+    def _truthy_header(self, value: str | None) -> bool:
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _strip_favorite_memory_marker_from_payload(self, payload: dict) -> tuple[dict, bool]:
+        cleaned = deepcopy(payload)
+        messages = cleaned.get("messages")
+        if not isinstance(messages, list):
+            return cleaned, False
+
+        current_user_index = self._current_turn_user_index(messages)
+        marker_in_current_turn = False
+        for index, message in enumerate(messages):
+            found = self._strip_favorite_memory_marker_from_message(message)
+            if found and index == current_user_index:
+                marker_in_current_turn = True
+        return cleaned, marker_in_current_turn
+
+    def _strip_favorite_memory_marker_from_message(self, message: Any) -> bool:
+        if not isinstance(message, dict):
+            return False
+        content = message.get("content")
+        if isinstance(content, str):
+            stripped, found = self._strip_favorite_memory_marker_from_text(content)
+            if found:
+                message["content"] = stripped
+            return found
+        if not isinstance(content, list):
+            return False
+
+        found_any = False
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            for key in ("text", "input_text"):
+                value = item.get(key)
+                if not isinstance(value, str):
+                    continue
+                stripped, found = self._strip_favorite_memory_marker_from_text(value)
+                if found:
+                    item[key] = stripped
+                    found_any = True
+        return found_any
+
+    def _strip_favorite_memory_marker_from_text(self, text: str) -> tuple[str, bool]:
+        if FAVORITE_MEMORY_MARKER not in text:
+            return text, False
+        return text.replace(FAVORITE_MEMORY_MARKER, "").strip(), True
+
     async def _build_core_memory_block(self, all_buckets: list[dict]) -> str:
         core_buckets = [
             bucket for bucket in all_buckets
@@ -1541,13 +1649,15 @@ class GatewayService:
             bucket for bucket in weather_buckets
             if "daily_impression" in {str(tag) for tag in bucket.get("metadata", {}).get("tags", [])}
         ]
-        weekly = [
-            bucket for bucket in weather_buckets
-            if "weekly_impression" in {str(tag) for tag in bucket.get("metadata", {}).get("tags", [])}
-        ]
         daily.sort(key=lambda bucket: bucket.get("metadata", {}).get("created", ""), reverse=True)
-        weekly.sort(key=lambda bucket: bucket.get("metadata", {}).get("created", ""), reverse=True)
-        selected = weekly[:1] + daily[:7]
+        selected = daily[:7]
+        if self.relationship_weather_include_weekly:
+            weekly = [
+                bucket for bucket in weather_buckets
+                if "weekly_impression" in {str(tag) for tag in bucket.get("metadata", {}).get("tags", [])}
+            ]
+            weekly.sort(key=lambda bucket: bucket.get("metadata", {}).get("created", ""), reverse=True)
+            selected = weekly[:1] + selected
 
         remaining = self.relationship_weather_budget
         parts = []
@@ -1863,18 +1973,17 @@ class GatewayService:
                 "Live private context for the current turn. Use it quietly when relevant.",
             ]
 
-            if persona_block.strip():
-                dynamic_sections.extend(["", persona_block])
-
             def add_section(title: str, content: str) -> None:
                 if content.strip():
                     dynamic_sections.extend(["", title, content])
 
-            add_section("Relationship Weather", relationship_weather)
-            add_section("Haven Favorite Memory", favorite_memory)
             add_section("Recent Context", recent_context)
             add_section("Recalled Memory", recalled_memory)
             add_section("Related Memory", related_memory)
+            if persona_block.strip():
+                dynamic_sections.extend(["", persona_block])
+            add_section("Relationship Weather", relationship_weather)
+            add_section("Haven Favorite Memory", favorite_memory)
 
         stable_context = "\n".join(stable_sections).strip()
         dynamic_context = "\n".join(dynamic_sections).strip()

@@ -325,6 +325,7 @@ async def test_reflect_daily_stores_love_letter_as_summary_anchor(test_config, m
 @pytest.mark.asyncio
 async def test_reflect_weekly_prefers_daily_impressions(test_config):
     cfg = _no_api_config(test_config)
+    cfg["reflection"]["weekly_enabled"] = True
     bucket_mgr = BucketManager(cfg)
     engine = ReflectionEngine(cfg)
     tz = ZoneInfo("Asia/Shanghai")
@@ -362,6 +363,18 @@ async def test_reflect_weekly_prefers_daily_impressions(test_config):
     assert result["materials"]["daily_impressions"] == 1
     assert "周内日印象" in bucket["content"]
     assert "weekly_impression" in bucket["metadata"]["tags"]
+
+
+@pytest.mark.asyncio
+async def test_reflect_weekly_disabled_by_default(test_config):
+    cfg = _no_api_config(test_config)
+    bucket_mgr = BucketManager(cfg)
+    engine = ReflectionEngine(cfg)
+
+    result = await engine.reflect("weekly", bucket_mgr, force=True)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "weekly_disabled"
 
 
 @pytest.mark.asyncio

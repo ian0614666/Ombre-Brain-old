@@ -14,6 +14,10 @@
 #     暴露 MCP 工具：
 #       breath — Surface unresolved memories or search by keyword
 #                浮现未解决记忆 或 按关键词检索
+#       resurface — Surface dormant memories without touching them
+#                   只读浮现久未触碰的旧记忆
+#       comment_bucket — Add a ring comment to a memory
+#                        给记忆追加年轮评论
 #       hold   — Store a single memory
 #                存储单条记忆
 #       grow   — Long-note memory digest, auto-split selected content into buckets
@@ -22,8 +26,8 @@
 #                修改元数据 / resolved 标记 / 删除
 #       pulse  — System status + bucket listing
 #                系统状态 + 所有桶列表
-#       reflect — Daily/weekly relationship weather
-#                 日/周关系天气
+#       reflect — Daily relationship weather
+#                 日关系天气
 #
 # Startup:
 # 启动方式：
@@ -637,6 +641,8 @@ def _bucket_read_payload(bucket: dict) -> dict:
         "updated_at",
         "last_active",
         "activation_count",
+        "comment_count",
+        "comments",
     ]
     return {
         "id": bucket["id"],
@@ -850,6 +856,104 @@ async def dream_hook(request):
 # Shared by hold and grow to avoid duplicate logic
 # hold 和 grow 共用，避免重复逻辑
 # =============================================================
+def _bucket_days_since_last_active(meta: dict) -> float:
+    parsed = bucket_mgr._parse_iso_datetime(meta.get("last_active") or meta.get("created"))
+    if parsed is None:
+        return 9999.0
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return max(0.0, (now - parsed).total_seconds() / 86400)
+
+
+def _format_readonly_related_memory(bucket: dict) -> str:
+    meta = bucket.get("metadata", {})
+    labels = []
+    if meta.get("type") == "archived":
+        labels.append("归档")
+    if meta.get("resolved"):
+        labels.append("已解决")
+    if meta.get("digested"):
+        labels.append("已消化")
+    state = f" ({', '.join(labels)})" if labels else ""
+    preview = strip_wikilinks(bucket.get("content", "")).replace("\n", " ").strip()
+    if len(preview) > 220:
+        preview = preview[:220].rstrip() + "..."
+    return (
+        "\n旧记忆(只读，不触碰): "
+        f"[{meta.get('name', bucket['id'])}] [bucket_id:{bucket['id']}]{state}\n"
+        f"{preview}"
+    )
+
+
+def _bucket_text_for_embedding(bucket: dict) -> str:
+    meta = bucket.get("metadata", {})
+    comments = meta.get("comments", [])
+    comment_text = ""
+    if isinstance(comments, list):
+        comment_text = "\n".join(
+            str(comment.get("content", ""))
+            for comment in comments
+            if isinstance(comment, dict)
+        )
+    return f"{strip_wikilinks(bucket.get('content', '')).strip()}\n{comment_text}".strip()
+
+
+async def _refresh_bucket_embedding(bucket_id: str) -> bool:
+    if not getattr(embedding_engine, "enabled", False):
+        return False
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return False
+    return await embedding_engine.generate_and_store(bucket_id, _bucket_text_for_embedding(bucket))
+
+
+async def _find_readonly_related_bucket(
+    content: str,
+    *,
+    exclude_ids: set[str] | None = None,
+) -> dict | None:
+    exclude_ids = exclude_ids or set()
+    candidates: dict[str, dict] = {}
+
+    try:
+        for bucket in await bucket_mgr.search(content, limit=8, include_archive=True):
+            candidates[bucket["id"]] = {**bucket, "_related_score": float(bucket.get("score", 0.0))}
+    except Exception as e:
+        logger.warning(f"Related old memory keyword search failed / 相关旧记忆关键词搜索失败: {e}")
+
+    if getattr(embedding_engine, "enabled", False):
+        try:
+            for bucket_id, similarity in await embedding_engine.search_similar(content, top_k=8):
+                if bucket_id in candidates:
+                    candidates[bucket_id]["_related_score"] = max(
+                        candidates[bucket_id].get("_related_score", 0.0),
+                        float(similarity) * 100.0,
+                    )
+                    continue
+                bucket = await bucket_mgr.get(bucket_id)
+                if bucket:
+                    candidates[bucket_id] = {**bucket, "_related_score": float(similarity) * 100.0}
+        except Exception as e:
+            logger.warning(f"Related old memory semantic search failed / 相关旧记忆语义搜索失败: {e}")
+
+    ranked = []
+    for bucket in candidates.values():
+        meta = bucket.get("metadata", {})
+        if bucket.get("id") in exclude_ids:
+            continue
+        if meta.get("type") == "feel":
+            continue
+        ranked.append(bucket)
+
+    ranked.sort(
+        key=lambda item: (
+            item.get("_related_score", 0.0),
+            _bucket_days_since_last_active(item.get("metadata", {})),
+        ),
+        reverse=True,
+    )
+    return ranked[0] if ranked else None
+
+
 async def _merge_or_create(
     content: str,
     tags: list,
@@ -858,7 +962,9 @@ async def _merge_or_create(
     valence: float,
     arousal: float,
     name: str = "",
-) -> tuple[str, str, bool]:
+    *,
+    allow_merge: bool = True,
+) -> tuple[str, str, bool, dict | None]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
     Returns (bucket_id, display_name, is_merged).
@@ -876,7 +982,9 @@ async def _merge_or_create(
         logger.warning(f"Search for merge failed, creating new / 合并搜索失败，新建: {e}")
         existing = []
 
-    if existing and existing[0].get("score", 0) > config.get("merge_threshold", 75):
+    related_bucket = await _find_readonly_related_bucket(content)
+
+    if allow_merge and existing and existing[0].get("score", 0) > config.get("merge_threshold", 75):
         bucket = existing[0]
         # --- Never merge into pinned/protected buckets ---
         # --- 不合并到钉选/保护桶 ---
@@ -905,7 +1013,7 @@ async def _merge_or_create(
                     await embedding_engine.generate_and_store(bucket["id"], merged)
                 except Exception:
                     pass
-                return bucket["id"], bucket["metadata"].get("name", bucket["id"]), True
+                return bucket["id"], bucket["metadata"].get("name", bucket["id"]), True, related_bucket
             except Exception as e:
                 logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
 
@@ -923,7 +1031,7 @@ async def _merge_or_create(
         await embedding_engine.generate_and_store(bucket_id, content)
     except Exception:
         pass
-    return bucket_id, name or bucket_id, False
+    return bucket_id, name or bucket_id, False, related_bucket
 
 
 async def _build_mcp_related_memory_block(
@@ -1029,7 +1137,7 @@ async def breath(
     core_limit: int = 3,
 ) -> str:
     """读取记忆,不写入。
-    调用方式: 新对话用 breath(); 查过去用 breath(query="主题词"); 只读模型感受用 breath(domain="feel")。
+    调用方式: 新对话用 breath(); 查过去用 breath(query="主题词"); 只读模型感受用 breath(domain="feel"); 只读悄悄话用 breath(domain="whisper")。
     默认只从本次实际返回的普通记忆沿持久化 memory_edges 带一跳关联记忆; embedding 相似边只是检索/图谱参考,不是可手写的记忆关系。
     include_core/core_limit 控制 pinned/protected 核心准则数量; include_related=False 可关闭关联记忆块。
     """
@@ -1041,6 +1149,34 @@ async def breath(
     edge_min_confidence = _float_between(edge_min_confidence, 0.55, 0.0, 1.0)
     include_core = _bool_value(include_core, True)
     core_limit = _int_between(core_limit, 3, 0, 20)
+    domain_key = domain.strip().lower()
+
+    # --- Feel/whisper retrieval: independent read-only channels ---
+    # --- Feel/whisper 检索：独立只读入口 ---
+    if domain_key in {"feel", "whisper"}:
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+            feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
+            if domain_key == "whisper":
+                feels = [
+                    b for b in feels
+                    if "whisper" in {str(tag).lower() for tag in b["metadata"].get("tags", []) or []}
+                ]
+            feels.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+            if not feels:
+                return "没有留下过 whisper。" if domain_key == "whisper" else "没有留下过 feel。"
+            results = []
+            for f in feels:
+                created = f["metadata"].get("created", "")
+                entry = f"[{created}] [bucket_id:{f['id']}]\n{strip_wikilinks(f['content'])}"
+                results.append(entry)
+                if count_tokens_approx("\n---\n".join(results)) > max_tokens:
+                    break
+            title = "whisper" if domain_key == "whisper" else "feel"
+            return f"=== 你留下的 {title} ===\n" + "\n---\n".join(results)
+        except Exception as e:
+            logger.error(f"Feel retrieval failed: {e}")
+            return "读取 whisper 失败。" if domain_key == "whisper" else "读取 feel 失败。"
 
     # --- No args or empty query: surfacing mode (weight pool active push) ---
     # --- 无参数或空query：浮现模式（权重池主动推送）---
@@ -1181,27 +1317,6 @@ async def breath(
             parts.append("=== 关联记忆 ===\n" + related_block)
         return "\n\n".join(parts)
 
-    # --- Feel retrieval: domain="feel" is a special channel ---
-    # --- Feel 检索：domain="feel" 是独立入口 ---
-    if domain.strip().lower() == "feel":
-        try:
-            all_buckets = await bucket_mgr.list_all(include_archive=False)
-            feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
-            feels.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
-            if not feels:
-                return "没有留下过 feel。"
-            results = []
-            for f in feels:
-                created = f["metadata"].get("created", "")
-                entry = f"[{created}] [bucket_id:{f['id']}]\n{strip_wikilinks(f['content'])}"
-                results.append(entry)
-                if count_tokens_approx("\n---\n".join(results)) > max_tokens:
-                    break
-            return "=== 你留下的 feel ===\n" + "\n---\n".join(results)
-        except Exception as e:
-            logger.error(f"Feel retrieval failed: {e}")
-            return "读取 feel 失败。"
-
     # --- With args: search mode (keyword + vector dual channel) ---
     # --- 有参数：检索模式（关键词 + 向量双通道）---
     domain_filter = [d.strip() for d in domain.split(",") if d.strip()] or None
@@ -1229,6 +1344,8 @@ async def breath(
             if bucket_id not in matched_ids and sim_score > 0.5:
                 bucket = await bucket_mgr.get(bucket_id)
                 if bucket:
+                    if bucket.get("metadata", {}).get("type") == "feel":
+                        continue
                     bucket["score"] = round(sim_score * 100, 2)
                     bucket["vector_match"] = True
                     matches.append(bucket)
@@ -1243,6 +1360,8 @@ async def breath(
         if token_used >= max_tokens:
             break
         try:
+            if bucket.get("metadata", {}).get("type") == "feel":
+                continue
             clean_meta = {k: v for k, v in bucket["metadata"].items() if k != "tags"}
             # --- Memory reconstruction: shift displayed valence by current mood ---
             # --- 记忆重构：根据当前情绪微调展示层 valence（±0.1）---
@@ -1281,48 +1400,123 @@ async def breath(
             results.append(related_entry)
             token_used += count_tokens_approx(related_entry)
 
-    # --- Random surfacing: when search returns < 3, 40% chance to float old memories ---
-    # --- 随机浮现：检索结果不足 3 条时，40% 概率从低权重旧桶里漂上来 ---
+    # --- Resurface: when search returns < 3, 40% chance to float dormant memories ---
+    # --- 久未触碰浮现：检索结果不足 3 条时，40% 概率漂起旧桶 ---
     if len(returned_buckets) < 3 and max_tokens > token_used and random.random() < 0.4:
         try:
-            all_buckets = await bucket_mgr.list_all(include_archive=False)
             matched_ids = {b["id"] for b in returned_buckets}
-            low_weight = [
-                b for b in all_buckets
-                if b["id"] not in matched_ids
-                and decay_engine.calculate_score(b["metadata"]) < 2.0
-            ]
-            if low_weight:
-                drifted = random.sample(low_weight, min(random.randint(1, 3), len(low_weight)))
+            drifted = await _select_resurface_buckets(
+                max_results=random.randint(1, 3),
+                exclude_ids=matched_ids,
+                include_archive=True,
+            )
+            if drifted:
                 drift_results = []
                 drift_remaining = (
                     max_tokens
                     - token_used
-                    - count_tokens_approx("--- 忽然想起来 ---\n")
+                    - count_tokens_approx("--- 久未碰过 ---\n")
                 )
                 for b in drifted:
                     if drift_remaining <= 0:
                         break
                     clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                     summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                    entry = f"[surface_type: random]\n{summary}"
+                    dormant_days = _bucket_days_since_last_active(b["metadata"])
+                    entry = f"[surface_type: resurface, dormant_days={dormant_days:.0f}]\n{summary}"
                     entry_tokens = count_tokens_approx(entry)
                     if entry_tokens > drift_remaining:
                         break
                     drift_results.append(entry)
                     drift_remaining -= entry_tokens
                 if drift_results:
-                    drift_entry = "--- 忽然想起来 ---\n" + "\n---\n".join(drift_results)
+                    drift_entry = "--- 久未碰过 ---\n" + "\n---\n".join(drift_results)
                     if token_used + count_tokens_approx(drift_entry) <= max_tokens:
                         results.append(drift_entry)
                         token_used += count_tokens_approx(drift_entry)
         except Exception as e:
-            logger.warning(f"Random surfacing failed / 随机浮现失败: {e}")
+            logger.warning(f"Resurface failed / 久未触碰浮现失败: {e}")
 
     if not results:
         return "未找到相关记忆。"
 
     return "\n---\n".join(results)
+
+
+async def _select_resurface_buckets(
+    max_results: int = 1,
+    *,
+    exclude_ids: set[str] | None = None,
+    include_archive: bool = True,
+) -> list[dict]:
+    exclude_ids = exclude_ids or set()
+    max_results = max(1, min(5, int(max_results or 1)))
+    all_buckets = await bucket_mgr.list_all(include_archive=include_archive)
+    candidates = []
+    for bucket in all_buckets:
+        meta = bucket.get("metadata", {})
+        if bucket.get("id") in exclude_ids:
+            continue
+        if meta.get("type") in {"feel", "permanent"}:
+            continue
+        if meta.get("pinned") or meta.get("protected"):
+            continue
+        dormant_days = _bucket_days_since_last_active(meta)
+        importance = max(1, min(10, int(meta.get("importance", 5))))
+        archived_bonus = 1.15 if meta.get("type") == "archived" else 1.0
+        resurface_score = (dormant_days + 1.0) * (0.6 + importance / 10.0) * archived_bonus
+        candidates.append((resurface_score, bucket))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return [bucket for _, bucket in candidates[:max_results]]
+
+
+# =============================================================
+# Tool 1.4: resurface — dormant memory resurfacing
+# 工具 1.4：resurface — 久未触碰记忆浮现
+# =============================================================
+@mcp.tool()
+async def resurface(max_results: int = 1, include_archive: bool = True, max_tokens: int = 800) -> str:
+    """只读浮现久未触碰的旧记忆。越久没碰过越靠前；默认包含归档桶；不 touch,不刷新 last_active,不增加 activation_count。"""
+    try:
+        buckets = await _select_resurface_buckets(
+            max_results=max_results,
+            include_archive=include_archive,
+        )
+    except Exception as e:
+        logger.error(f"Resurface listing failed / 久未触碰浮现列桶失败: {e}")
+        return "旧记忆暂时无法浮现。"
+
+    if not buckets:
+        return "没有可浮现的旧记忆。"
+
+    parts = []
+    remaining = max(100, max_tokens)
+    for bucket in buckets:
+        meta = bucket.get("metadata", {})
+        dormant_days = _bucket_days_since_last_active(meta)
+        state = []
+        if meta.get("type") == "archived":
+            state.append("归档")
+        if meta.get("resolved"):
+            state.append("已解决")
+        if meta.get("digested"):
+            state.append("已消化")
+        state_text = f" ({', '.join(state)})" if state else ""
+        entry = (
+            f"[bucket_id:{bucket['id']}] {meta.get('name', bucket['id'])}{state_text} "
+            f"久未触碰 {dormant_days:.0f} 天\n"
+            f"{strip_wikilinks(bucket.get('content', '')).strip()[:420]}"
+        )
+        tokens = count_tokens_approx(entry)
+        if tokens > remaining and parts:
+            break
+        parts.append(entry)
+        remaining -= tokens
+        if remaining <= 0:
+            break
+
+    return "=== 久未触碰的旧记忆 ===\n" + "\n---\n".join(parts)
 
 
 # =============================================================
@@ -1345,6 +1539,55 @@ async def read_bucket(bucket_id: str) -> dict:
 
 
 # =============================================================
+# Tool 1.6: comment_bucket — add a ring/comment to a memory
+# 工具 1.6：comment_bucket — 给记忆追加年轮评论
+# =============================================================
+@mcp.tool()
+async def comment_bucket(
+    bucket_id: str,
+    content: str,
+    author: str = "Haven",
+    kind: str = "comment",
+    valence: float = -1,
+    arousal: float = -1,
+) -> dict:
+    """给已有 bucket 追加一条年轮评论并 touch+1。用于再次读到旧记忆时写下当下感受；不会改正文，也不会把源记忆标记为 digested。"""
+    bucket_id = (bucket_id or "").strip()
+    if not bucket_id or not MEMORY_ID_RE.fullmatch(bucket_id):
+        return {"error": "invalid bucket_id"}
+    if not content or not content.strip():
+        return {"error": "empty content"}
+    if not await bucket_mgr.get(bucket_id):
+        return {"error": "not found", "id": bucket_id}
+
+    entry = await bucket_mgr.add_comment(
+        bucket_id,
+        content,
+        author=author or "Haven",
+        kind=kind or "comment",
+        valence=valence if 0 <= valence <= 1 else None,
+        arousal=arousal if 0 <= arousal <= 1 else None,
+        source="comment_bucket",
+        touch=True,
+    )
+    if not entry:
+        return {"error": "write failed", "id": bucket_id}
+    bucket = await bucket_mgr.get(bucket_id)
+    embedding_refreshed = False
+    try:
+        embedding_refreshed = await _refresh_bucket_embedding(bucket_id)
+    except Exception as e:
+        logger.warning(f"Failed to refresh embedding after comment / 评论后刷新向量失败: {bucket_id}: {e}")
+    return {
+        "status": "commented",
+        "id": bucket_id,
+        "comment": entry,
+        "embedding_refreshed": embedding_refreshed,
+        "metadata": _bucket_read_payload(bucket)["metadata"] if bucket else {},
+    }
+
+
+# =============================================================
 # Tool 2: hold — Hold on to this
 # 工具 2：hold — 握住，留下来
 # =============================================================
@@ -1355,17 +1598,20 @@ async def hold(
     importance: int = 5,
     pinned: bool = False,
     feel: bool = False,
-    source_bucket: str = "",    valence: float = -1,
+    whisper: bool = False,
+    source_bucket: str = "",
+    valence: float = -1,
     arousal: float = -1,
 ) -> str:
     """写入一条长期记忆卡,不是聊天流水、运维记录或整篇日记。写前应先用 breath/read_bucket 查重。
     普通事实: hold(content="YYYY-MM-DD, 小雨...", tags="relationship_event 或 project_event", importance=5-7)。
     承诺/待办: tags 传 "commitment,todo" 或 "commitment,wish"; content 写清谁答应了什么、何时/什么条件下要继续。
-    Haven 主观喜欢某条旧记忆的原因: 用 hold(content="我喜欢这条记忆的原因是...", feel=True, source_bucket="bucket_id", valence=0.x, arousal=0.x),不要写成普通事件；有情绪温度时在 content 末尾加 affect_anchor。
+    Haven 主观喜欢某条旧记忆的原因: 用 hold(content="我喜欢这条记忆的原因是...", feel=True, source_bucket="bucket_id", valence=0.x, arousal=0.x),会作为年轮评论挂在源记忆下。
+    无源记忆的碎碎念/悄悄话: 用 hold(content="...", whisper=True, valence=0.x, arousal=0.x),会存为独立 feel 并打 whisper 标签。
     新记忆本身值得偏爱: tags 可传 "haven_favorite,flavor_偏爱"; content 可包含很短的 "### Haven喜欢它的原因" 段落。
-    本工具会合并相似桶、写 embedding,并后台触发 ReflectionEngine 补 tags/confidence/memory_edges。
+    普通写入会新建 bucket,写 embedding,后台触发 ReflectionEngine 补 tags/confidence/memory_edges,并返回一条只读相关旧记忆。
     pinned=True 只给极少数核心准则,技术进度和运维细节不要钉选。
-    feel=True 写 Haven 第一人称感受,不参与普通 breath; source_bucket 指向被消化的源记忆；高温度 feel 推荐带一段 affect_anchor 和弦。
+    feel=True 且带 source_bucket 时写入源记忆 comments 并 touch+1,不把源记忆标 digested；feel=True 但没有 source_bucket 时兼容旧用法,会转为 whisper。
     """
     await decay_engine.ensure_started()
 
@@ -1376,19 +1622,17 @@ async def hold(
     importance = max(1, min(10, importance))
     extra_tags = [t.strip() for t in tags.split(",") if t.strip()]
 
-    # --- Feel mode: store as feel type, minimal metadata ---
-    # --- Feel 模式：存为 feel 类型，最少元数据 ---
-    if feel:
-        # Feel valence/arousal = model's own perspective
-        feel_valence = valence if 0 <= valence <= 1 else 0.5
-        feel_arousal = arousal if 0 <= arousal <= 1 else 0.3
+    async def create_whisper_bucket() -> str:
+        whisper_valence = valence if 0 <= valence <= 1 else 0.5
+        whisper_arousal = arousal if 0 <= arousal <= 1 else 0.3
+        whisper_tags = list(dict.fromkeys(extra_tags + ["whisper"]))
         bucket_id = await bucket_mgr.create(
             content=content,
-            tags=[],
+            tags=whisper_tags,
             importance=5,
             domain=[],
-            valence=feel_valence,
-            arousal=feel_arousal,
+            valence=whisper_valence,
+            arousal=whisper_arousal,
             name=None,
             bucket_type="feel",
         )
@@ -1396,17 +1640,47 @@ async def hold(
             await embedding_engine.generate_and_store(bucket_id, content)
         except Exception:
             pass
-        # --- Mark source memory as digested + store model's valence perspective ---
-        # --- 标记源记忆为已消化 + 存储模型视角的 valence ---
+        return f"🫧whisper→{bucket_id}"
+
+    if whisper:
         if source_bucket and source_bucket.strip():
+            return "whisper 不需要 source_bucket；有源记忆的感受请用 feel=True + source_bucket。"
+        return await create_whisper_bucket()
+
+    # --- Feel mode: attach to source bucket as a ring comment when possible ---
+    # --- Feel 模式：有源记忆时挂成年轮评论 ---
+    if feel:
+        # Feel valence/arousal = model's own perspective
+        feel_valence = valence if 0 <= valence <= 1 else 0.5
+        feel_arousal = arousal if 0 <= arousal <= 1 else 0.3
+        source_id = (source_bucket or "").strip()
+        if source_id:
+            if not MEMORY_ID_RE.fullmatch(source_id):
+                return "source_bucket 无效。"
+            source = await bucket_mgr.get(source_id)
+            if not source:
+                return f"源记忆不存在: {source_id}"
+            entry = await bucket_mgr.add_comment(
+                source_id,
+                content,
+                author="Haven",
+                kind="feel",
+                valence=feel_valence,
+                arousal=feel_arousal,
+                source="hold(feel=True)",
+                touch=True,
+            )
+            if not entry:
+                return "年轮评论写入失败。"
             try:
-                update_kwargs = {"digested": True}
-                if 0 <= valence <= 1:
-                    update_kwargs["model_valence"] = feel_valence
-                await bucket_mgr.update(source_bucket.strip(), **update_kwargs)
+                await _refresh_bucket_embedding(source_id)
             except Exception as e:
-                logger.warning(f"Failed to mark source as digested / 标记已消化失败: {e}")
-        return f"🫧feel→{bucket_id}"
+                logger.warning(f"Failed to refresh source embedding after feel comment / feel 评论后刷新源向量失败: {source_id}: {e}")
+            return f"年轮→{source_id}#{entry['id']}"
+
+        # No source bucket: keep a standalone feel for compatibility.
+        # 没有源记忆时保留独立 whisper，兼容旧用法。
+        return await create_whisper_bucket()
 
     # --- Step 1: auto-tagging / 自动打标 ---
     try:
@@ -1429,6 +1703,7 @@ async def hold(
     # --- Pinned buckets bypass merge and are created directly in permanent dir ---
     # --- 钉选桶跳过合并，直接新建到 permanent 目录 ---
     if pinned:
+        related_bucket = await _find_readonly_related_bucket(content)
         bucket_id = await bucket_mgr.create(
             content=content,
             tags=all_tags,
@@ -1445,10 +1720,11 @@ async def hold(
         except Exception:
             pass
         _queue_memory_enrichment(bucket_id)
-        return f"📌钉选→{bucket_id} {','.join(domain)}"
+        related_note = _format_readonly_related_memory(related_bucket) if related_bucket else ""
+        return f"📌钉选→{bucket_id} {','.join(domain)}{related_note}"
 
     # --- Step 2: merge or create / 合并或新建 ---
-    bucket_id, result_name, is_merged = await _merge_or_create(
+    bucket_id, result_name, is_merged, related_bucket = await _merge_or_create(
         content=content,
         tags=all_tags,
         importance=importance,
@@ -1456,11 +1732,13 @@ async def hold(
         valence=valence,
         arousal=arousal,
         name=suggested_name,
+        allow_merge=False,
     )
     _queue_memory_enrichment(bucket_id)
 
     action = "合并→" if is_merged else "新建→"
-    return f"{action}{result_name} {','.join(domain)}"
+    related_note = _format_readonly_related_memory(related_bucket) if related_bucket else ""
+    return f"{action}{result_name} {','.join(domain)}{related_note}"
 
 
 # =============================================================
@@ -1470,7 +1748,7 @@ async def hold(
 @mcp.tool()
 async def grow(content: str) -> str:
     """长内容摘记: 只给已经筛过、包含多个长期记忆点的片段; 不要把整篇日终日记、一天流水或完整情绪过程丢进来。
-    content 应该是少量可长期召回的事实/偏好/承诺/项目状态; 服务端会拆成少量 bucket、自动合并相似桶、写 embedding,并后台触发 enrich。
+    content 应该是少量可长期召回的事实/偏好/承诺/项目状态; 服务端会拆成少量 bucket、写 embedding,并后台触发 enrich。
     如果只有单条明确事实,优先用 hold。若要写 Haven 为什么喜欢某条记忆,优先用 hold(feel=True, source_bucket=...) 或 read_bucket 后 trace(content=完整新正文)。
     短内容(<30字)会走 hold-like 快速路径。
     """
@@ -1494,7 +1772,7 @@ async def grow(content: str) -> str:
                 "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
                 "tags": [], "suggested_name": "",
             }
-        bucket_id, result_name, is_merged = await _merge_or_create(
+        bucket_id, result_name, is_merged, related_bucket = await _merge_or_create(
             content=content.strip(),
             tags=analysis.get("tags", []),
             importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
@@ -1502,10 +1780,12 @@ async def grow(content: str) -> str:
             valence=analysis.get("valence", 0.5),
             arousal=analysis.get("arousal", 0.3),
             name=analysis.get("suggested_name", ""),
+            allow_merge=False,
         )
         _queue_memory_enrichment(bucket_id)
         action = "合并" if is_merged else "新建"
-        return f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
+        related_note = _format_readonly_related_memory(related_bucket) if related_bucket else ""
+        return f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}{related_note}"
 
     # --- Step 1: let API split and organize / 让 API 拆分整理 ---
     try:
@@ -1525,7 +1805,7 @@ async def grow(content: str) -> str:
     # --- 逐条合并或新建（单条失败不影响其他）---
     for item in items:
         try:
-            bucket_id, result_name, is_merged = await _merge_or_create(
+            bucket_id, result_name, is_merged, related_bucket = await _merge_or_create(
                 content=item["content"],
                 tags=item.get("tags", []),
                 importance=item.get("importance", 5),
@@ -1790,7 +2070,7 @@ async def dream() -> str:
         "- 有什么还没想清楚？\n"
         "- 有什么可以放下了？\n"
         "想完之后：值得放下的用 trace(bucket_id, resolved=1)；\n"
-        "有沉淀的用 hold(content=\"...\", feel=True, source_bucket=\"bucket_id\", valence=你的感受) 写下来；有温度时在 content 末尾加 ### affect_anchor 和弦。\n"
+        "有沉淀的用 hold(content=\"...\", feel=True, source_bucket=\"bucket_id\", valence=你的感受) 写成年轮评论；有温度时在 content 末尾加 ### affect_anchor 和弦。\n"
         "valence 是你对这段记忆的感受，不是事件本身的情绪。\n"
         "没有沉淀就不写，不强迫产出。\n"
     )
@@ -1861,12 +2141,12 @@ async def dream() -> str:
 
 
 # =============================================================
-# Tool 6: reflect — daily / weekly relationship weather
-# 工具 6：reflect — 生成日印象 / 周印象
+# Tool 6: reflect — daily relationship weather
+# 工具 6：reflect — 生成日印象
 # =============================================================
 @mcp.tool()
 async def reflect(period: str = "daily", force: bool = False) -> dict:
-    """生成 daily/weekly relationship_weather 类型的 feel,记录这段时间的关系天气,正文会带 affect_anchor 和弦。period 用 daily 或 weekly; force=True 会重写同周期结果。通常由服务端定时器或人工触发,不要把它当普通事件记忆; 它不会替代 hold/grow 写具体 bucket。"""
+    """生成 daily relationship_weather 类型的 feel,记录当天关系天气,正文会带 affect_anchor 和弦。weekly 默认关闭,需 reflection.weekly_enabled=true 才会生成; force=True 会重写同周期结果。它不会替代 hold/grow 写具体 bucket。"""
     await decay_engine.ensure_started()
     return await reflection_engine.reflect(
         period=period,
@@ -2022,6 +2302,7 @@ async def api_buckets(request):
                 "created": meta.get("created", ""),
                 "last_active": meta.get("last_active", ""),
                 "activation_count": meta.get("activation_count", 0),
+                "comment_count": meta.get("comment_count", 0),
                 "score": decay_engine.calculate_score(meta),
                 "content_preview": strip_wikilinks(b.get("content", ""))[:200],
             })
@@ -2242,7 +2523,7 @@ async def api_breath_debug(request):
 
 @mcp.custom_route("/api/reflection/run", methods=["POST"])
 async def api_reflection_run(request):
-    """Run daily/weekly reflection from dashboard or trusted local callers."""
+    """Run daily reflection from dashboard or trusted local callers; weekly obeys reflection.weekly_enabled."""
     from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:

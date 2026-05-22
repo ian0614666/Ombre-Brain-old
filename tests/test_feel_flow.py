@@ -3,9 +3,9 @@
 # 测试 3：Feel 流程 —— 端到端 feel 管道测试
 #
 # Tests the complete feel lifecycle:
-#   1. hold(content, feel=True) → creates feel bucket
+#   1. hold(content, feel=True, source_bucket=X) → adds a ring comment to X
 #   2. breath(domain="feel") → retrieves feel buckets by time
-#   3. source_bucket marked as digested
+#   3. source_bucket gets touched but is not marked digested
 #   4. dream() → returns feel crystallization hints
 #   5. trace() → can modify/hide feel
 #   6. Decay score invariants for feel
@@ -143,8 +143,8 @@ class TestFeelLifecycle:
         assert "Feel #3" in feels[0]["content"]
 
     @pytest.mark.asyncio
-    async def test_source_bucket_marked_digested(self, isolated_tools):
-        """hold(feel=True, source_bucket=X) marks X as digested."""
+    async def test_source_bucket_comment_touch_does_not_mark_digested(self, isolated_tools):
+        """A source-memory feel comment touches X without marking it digested."""
         bm, dh, de, bd = isolated_tools
 
         # Create a normal bucket first
@@ -160,20 +160,19 @@ class TestFeelLifecycle:
         source = next(b for b in all_b if b["id"] == source_id)
         assert not source["metadata"].get("digested", False)
 
-        # Create feel referencing it
-        await bm.create(
-            content="那次争吵让我意识到沟通的重要性",
-            tags=[], importance=5, domain=[],
-            valence=0.5, arousal=0.4,
-            name=None, bucket_type="feel",
+        await bm.add_comment(
+            source_id,
+            "那次争吵让我意识到沟通的重要性",
+            kind="feel",
+            valence=0.5,
+            arousal=0.4,
         )
-        # Manually mark digested (simulating server.py hold logic)
-        await bm.update(source_id, digested=True)
 
-        # Verify digested
         all_b = await bm.list_all()
         source = next(b for b in all_b if b["id"] == source_id)
-        assert source["metadata"].get("digested") is True
+        assert not source["metadata"].get("digested", False)
+        assert source["metadata"]["comment_count"] == 1
+        assert source["metadata"]["activation_count"] == 1
 
     @pytest.mark.asyncio
     async def test_feel_never_decays(self, isolated_tools):

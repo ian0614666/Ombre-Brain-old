@@ -149,7 +149,8 @@ gateway:
   recent_context_budget: 300
   recalled_memory_budget: 400
   relationship_weather_budget: 220
-  favorite_memory_budget: 0
+  relationship_weather_include_weekly: false
+  favorite_memory_budget: 180
   favorite_memory_max_cards: 1
   related_memory_budget: 220
   core_memory_interval_rounds: 0
@@ -237,6 +238,7 @@ reflection:
   max_tokens: 700
   timezone: "Asia/Shanghai"
   daily_hour: 4                   # generate daily impression after this local hour
+  weekly_enabled: false            # weekly impressions are off by default; daily impressions remain
   weekly_day: 0                   # 0=Monday, 6=Sunday; auto run writes the previous week
   weekly_hour: 4
   check_interval_minutes: 60

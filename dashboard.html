@@ -298,6 +298,28 @@
     overflow-y: auto;
     box-shadow: inset 3px 3px 6px var(--shadow-dark-subtle), inset -3px -3px 6px var(--shadow-light);
   }
+  .detail-comments {
+    margin-top: 18px;
+  }
+  .detail-comments h3 {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--accent);
+    margin: 0 0 10px;
+  }
+  .comment-item {
+    padding: 12px 14px;
+    margin-bottom: 10px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--surface);
+    font-size: 12px;
+    line-height: 1.7;
+  }
+  .comment-meta {
+    color: var(--text-light);
+    margin-bottom: 6px;
+  }
 
   .config-section {
     margin-bottom: 28px;
@@ -1307,6 +1329,17 @@ async function showDetail(id) {
     if (!res) return;
     var b = await res.json();
     var meta = b.metadata || {};
+    var comments = Array.isArray(meta.comments) ? meta.comments : [];
+    var commentsHtml = comments.length
+      ? '<div class="detail-comments"><h3>年轮评论</h3>' + comments.map(function(c) {
+          var va = c.valence != null ? ' · V' + Number(c.valence).toFixed(2) : '';
+          var ar = c.arousal != null ? ' · A' + Number(c.arousal).toFixed(2) : '';
+          return '<div class="comment-item">' +
+            '<div class="comment-meta">' + esc(c.created || '—') + ' · ' + esc(c.author || '—') + ' · ' + esc(c.kind || 'comment') + va + ar + '</div>' +
+            '<div>' + esc(c.content || '') + '</div>' +
+          '</div>';
+        }).join('') + '</div>'
+      : '';
     content.innerHTML =
       '<h2>' + esc(meta.name || id) + '</h2>' +
       '<div class="detail-meta">' +
@@ -1330,7 +1363,8 @@ async function showDetail(id) {
         '<div class="field"><label>创建</label>' + (meta.created || '—') + '</div>' +
         '<div class="field"><label>最后活跃</label>' + (meta.last_active || '—') + '</div>' +
       '</div>' +
-      '<div class="detail-content">' + esc(b.content) + '</div>';
+      '<div class="detail-content">' + esc(b.content) + '</div>' +
+      commentsHtml;
   } catch (e) {
     content.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
   }
