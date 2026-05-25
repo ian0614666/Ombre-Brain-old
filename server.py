@@ -3533,6 +3533,7 @@ if __name__ == "__main__":
         # --- Application-level keepalive: ping /health every 60s ---
         # --- 应用层保活：每 60 秒 ping 一次 /health，防止 Cloudflare Tunnel 空闲断连 ---
         async def _keepalive_loop():
+            await _ensure_decay_engine_started_for_transport(transport)
             await asyncio.sleep(10)  # Wait for server to fully start
             async with httpx.AsyncClient() as client:
                 while True:
