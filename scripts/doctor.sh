@@ -237,7 +237,11 @@ fi
 print_env_status "OMBRE_API_KEY" "（脱水/导入抽取默认使用）"
 print_env_status "OMBRE_EMBEDDING_API_KEY" "（embedding 独立 key，未配时可能回退脱水 key）"
 print_env_status "OMBRE_DREAM_API_KEY" "（夜梦模型 key；没开夜梦可忽略）"
-print_env_status "OMBRE_GATEWAY_TOKEN" "（Gateway 对外鉴权 token；不用 Gateway 可忽略）"
+if service_in_compose "${GATEWAY_SERVICE}"; then
+  print_env_status "OMBRE_GATEWAY_TOKEN" "（Gateway 对外鉴权 token）"
+else
+  info "compose 未启用 ${GATEWAY_SERVICE}，跳过 Gateway token 检查"
+fi
 
 extra_keys="$(extract_config_key_envs || true)"
 if [[ -n "${extra_keys}" ]]; then
@@ -278,8 +282,13 @@ fi
 
 section "容器内 key"
 if has_command docker && docker info >/dev/null 2>&1; then
-  container_env_status "${OMBRE_SERVICE}" \
-    OMBRE_API_KEY OMBRE_EMBEDDING_API_KEY OMBRE_DREAM_API_KEY OMBRE_GATEWAY_TOKEN
+  if service_in_compose "${GATEWAY_SERVICE}"; then
+    container_env_status "${OMBRE_SERVICE}" \
+      OMBRE_API_KEY OMBRE_EMBEDDING_API_KEY OMBRE_DREAM_API_KEY OMBRE_GATEWAY_TOKEN
+  else
+    container_env_status "${OMBRE_SERVICE}" \
+      OMBRE_API_KEY OMBRE_EMBEDDING_API_KEY OMBRE_DREAM_API_KEY
+  fi
 else
   warn "Docker 不可用，跳过容器内环境变量检查"
 fi

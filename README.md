@@ -959,9 +959,9 @@ docker compose -f compose.hk.yml exec -T ombre-brain python scripts/cleanup_migr
 
 脚本用途：
 
-- `scripts/one_click.sh`：新手入口。菜单包含首次部署、更新版本、错误排查和 embedding 维护。首次部署、更新和排查都会先选择 `VPS / Windows / 手机`。VPS 和 Windows 走 Docker 并生成本机专用的 `compose.local.yml`；手机按 Termux/Python 直跑并生成 `start_mobile.sh`。模型配置和 key 会交互式填写，key 写入 `.env`，非密钥配置写入 `config.yaml`，最后生成 `connection_guide.txt` 告诉客户端 URL 怎么填。
+- `scripts/one_click.sh`：新手入口。菜单包含首次部署、更新版本、错误排查和 embedding 维护。首次部署会先选择 `VPS / Windows / 手机`，再选择 `只用 Ombre MCP 部分 / 部署全部`。只用 MCP 时只启动 MCP 工具和 Dashboard，不配置、不启动 Gateway；部署全部时才会继续填写 Gateway 上游、token 和 OpenAI-compatible 客户端地址。VPS 和 Windows 走 Docker 并生成本机专用的 `compose.local.yml`；手机按 Termux/Python 直跑并生成 `start_mobile.sh`。模型配置和 key 会交互式填写，key 写入 `.env`，非密钥配置写入 `config.yaml`，最后生成 `connection_guide.txt` 告诉客户端 URL 怎么填。
 - `./ob`：短入口，等同于 `bash scripts/one_click.sh`。也可以在菜单里选“安装短命令 ob”，写入当前用户的 shell 配置；之后任意位置输入 `ob` 就能打开菜单。
-- `scripts/doctor.sh`：适合“更新后不能用、端口不通、怀疑 key 没配好”。它只读检查，不会重启服务、不改配置、不打印 key。会提示 `.env/config.yaml`、Docker Compose 状态、健康接口、容器内环境变量和最近错误日志。
+- `scripts/doctor.sh`：适合“更新后不能用、端口不通、怀疑 key 没配好”。它只读检查，不会重启服务、不改配置、不打印 key。会提示 `.env/config.yaml`、Docker Compose 状态、健康接口、容器内环境变量和最近错误日志；如果 compose 里没有启用 Gateway，会自动跳过 Gateway token 检查。
 - `scripts/update_deploy.sh`：适合“我只想更新到最新版”。它会 `git pull --ff-only`，如果 compose 里是 `build:` 就重建镜像，否则先 pull 镜像，再启动容器，最后做健康检查。
 - `scripts/embedding_backfill.sh`：只补缺失的 embedding，适合升级后发现部分记忆没有语义召回。
 - `scripts/embedding_rebuild.sh`：重建全部 embedding，适合 embedding 模型、base_url 或 embedding 文本格式改过之后使用。它会消耗更多 API 次数。
@@ -981,10 +981,11 @@ docker compose -f compose.hk.yml exec -T ombre-brain python scripts/cleanup_migr
 - 每个 provider 可选单 key 或多 key，多 key 会写成 `api_key_envs`。
 - 如果多个 provider 暴露了同名模型，脚本会自动把 Gateway 里显示的模型名改成 `provider/模型名`，同时保留 `upstream_model` 指向真实模型名，避免路由撞名。
 
-`one_click.sh` 的客户端提示会按部署环境给 URL：
+`one_click.sh` 的客户端提示会按部署环境和功能范围给 URL：
 
-- VPS：客户端填 `http://你的公网IP或域名:18002/v1` 作为 Gateway Base URL；MCP 工具 URL 是 `http://你的公网IP或域名:18001/mcp`。公网使用时记得放行端口，长期使用建议反代到 HTTPS。
-- Windows：客户端在同一台电脑就填 `127.0.0.1`；手机连 Windows 时填 Windows 的局域网 IP，并允许防火墙通过端口。
+- 只用 MCP：客户端只填 MCP 工具 URL，例如 `http://你的公网IP或域名:18001/mcp`；Dashboard 是 `http://你的公网IP或域名:18001/dashboard`。不会输出 Gateway Base URL。
+- 部署全部：除了 MCP URL，还会输出 Gateway Base URL，例如 VPS 默认是 `http://你的公网IP或域名:18002/v1`。
+- Windows：客户端在同一台电脑就填 `127.0.0.1`；手机连 Windows 时填 Windows 的局域网 IP，并允许防火墙通过脚本提示的端口。
 - 手机：按 Termux/Python 直跑处理。同一台手机填 `127.0.0.1`；其它设备连手机时填手机局域网 IP，并保持 Termux 后台运行。
 
 ## 本地开发与测试

@@ -12,6 +12,8 @@ DEPLOY_LABEL="VPS 部署"
 DEFAULT_BRAIN_PORT="18001"
 DEFAULT_GATEWAY_PORT="18002"
 CLIENT_HOST="127.0.0.1"
+FEATURE_SCOPE="full"
+FEATURE_LABEL="部署全部"
 
 line() {
   printf '%s\n' '------------------------------------------------------------'
@@ -314,6 +316,25 @@ configure_gateway_upstreams() {
   GATEWAY_UPSTREAMS_YAML="$(build_gateway_upstreams_yaml)"
 }
 
+choose_feature_scope() {
+  local choice
+  line
+  printf '选择功能范围\n'
+  printf '1. 只用 Ombre MCP 部分（MCP 工具 + Dashboard，不启动 Gateway）\n'
+  printf '2. 部署全部（MCP + Dashboard + Gateway 自动注入）\n'
+  read -r -p '输入（1-2）：' choice
+  case "${choice}" in
+    1)
+      FEATURE_SCOPE="mcp"
+      FEATURE_LABEL="只用 Ombre MCP 部分"
+      ;;
+    *)
+      FEATURE_SCOPE="full"
+      FEATURE_LABEL="部署全部"
+      ;;
+  esac
+}
+
 write_env_file() {
   local dehy_key="$1"
   local embedding_key="$2"
@@ -454,8 +475,12 @@ dream:
 
 # Client URL hints:
 #   Ombre-Brain: http://127.0.0.1:${brain_port}
+EOF
+  if [[ "${FEATURE_SCOPE}" == "full" ]]; then
+    cat >> "config.yaml" <<EOF
 #   Gateway:     http://127.0.0.1:${gateway_port}
 EOF
+  fi
   printf '已写入 config.yaml\n'
 }
 
@@ -477,14 +502,23 @@ services:
       OMBRE_TRANSPORT: streamable-http
       OMBRE_BUCKETS_DIR: /data
       OMBRE_STATE_DIR: /state
+EOF
+  if [[ "${FEATURE_SCOPE}" == "full" ]]; then
+    cat >> "${LOCAL_COMPOSE_FILE}" <<EOF
       OMBRE_GATEWAY_ADMIN_URL: http://ombre-gateway:8010/api/config
+EOF
+  fi
+  cat >> "${LOCAL_COMPOSE_FILE}" <<EOF
     ports:
       - "${brain_port}:8000"
     volumes:
       - ./buckets:/data
       - ./state:/state
       - ./config.yaml:/app/config.yaml:ro
+EOF
 
+  if [[ "${FEATURE_SCOPE}" == "full" ]]; then
+    cat >> "${LOCAL_COMPOSE_FILE}" <<EOF
   ombre-gateway:
     build: .
     container_name: ombre-gateway
@@ -503,6 +537,7 @@ services:
       - ./state:/state
       - ./config.yaml:/app/config.yaml:ro
 EOF
+  fi
   printf '已写入 %s\n' "${LOCAL_COMPOSE_FILE}"
 }
 
@@ -606,17 +641,29 @@ print_client_guide() {
   printf '客户端填写方式\n'
   printf 'Dashboard: %s\n' "${dashboard_url}"
   printf 'MCP 工具模式 URL: %s\n' "${mcp_url}"
-  printf 'Gateway / OpenAI-compatible Base URL: %s\n' "${gateway_base_url}"
-  printf 'Gateway API Key: .env 里的 OMBRE_GATEWAY_TOKEN\n'
-  printf '模型名: 客户端可从 %s/models 读取；同名模型会显示成 provider/模型名。\n' "${gateway_base_url}"
+  if [[ "${FEATURE_SCOPE}" == "full" ]]; then
+    printf 'Gateway / OpenAI-compatible Base URL: %s\n' "${gateway_base_url}"
+    printf 'Gateway API Key: .env 里的 OMBRE_GATEWAY_TOKEN\n'
+    printf '模型名: 客户端可从 %s/models 读取；同名模型会显示成 provider/模型名。\n' "${gateway_base_url}"
+  else
+    printf 'Gateway / OpenAI-compatible: 未部署；客户端请使用 MCP 工具模式。\n'
+  fi
   printf '会话头: 如果客户端支持自定义 header，可加 X-Ombre-Session-Id: main\n'
 
   case "${DEPLOY_TARGET}" in
     vps)
-      printf '\nVPS 提醒：安全组/防火墙要放行端口 %s 和 %s；公网长期使用更建议反代到 HTTPS。\n' "${brain_port}" "${gateway_port}"
+      if [[ "${FEATURE_SCOPE}" == "full" ]]; then
+        printf '\nVPS 提醒：安全组/防火墙要放行端口 %s 和 %s；公网长期使用更建议反代到 HTTPS。\n' "${brain_port}" "${gateway_port}"
+      else
+        printf '\nVPS 提醒：安全组/防火墙至少要放行端口 %s；公网长期使用更建议反代到 HTTPS。\n' "${brain_port}"
+      fi
       ;;
     windows)
-      printf '\nWindows 提醒：同一台电脑填 127.0.0.1；手机连 Windows 时填 Windows 局域网 IP，并确认防火墙允许端口 %s/%s。\n' "${brain_port}" "${gateway_port}"
+      if [[ "${FEATURE_SCOPE}" == "full" ]]; then
+        printf '\nWindows 提醒：同一台电脑填 127.0.0.1；手机连 Windows 时填 Windows 局域网 IP，并确认防火墙允许端口 %s/%s。\n' "${brain_port}" "${gateway_port}"
+      else
+        printf '\nWindows 提醒：同一台电脑填 127.0.0.1；手机连 Windows 时填 Windows 局域网 IP，并确认防火墙允许端口 %s。\n' "${brain_port}"
+      fi
       ;;
     mobile)
       printf '\n手机提醒：同一台手机填 127.0.0.1；其它设备连手机时填手机局域网 IP，并保持 Termux 后台运行。\n'
@@ -633,11 +680,19 @@ MCP tool mode:
   URL: ${mcp_url}
 
 Gateway / OpenAI-compatible:
+EOF
+  if [[ "${FEATURE_SCOPE}" == "full" ]]; then
+    cat >> connection_guide.txt <<EOF
   Base URL: ${gateway_base_url}
   API Key: value of OMBRE_GATEWAY_TOKEN in .env
   Models endpoint: ${gateway_base_url}/models
   Optional header: X-Ombre-Session-Id: main
 EOF
+  else
+    cat >> connection_guide.txt <<EOF
+  Not deployed. Use MCP tool mode instead.
+EOF
+  fi
   printf '\n已写入 connection_guide.txt\n'
 }
 
@@ -664,14 +719,24 @@ set +a
 export OMBRE_TRANSPORT=streamable-http
 export OMBRE_BUCKETS_DIR="${PWD}/buckets"
 export OMBRE_STATE_DIR="${PWD}/state"
+EOF
+  if [[ "${FEATURE_SCOPE}" == "full" ]]; then
+    cat >> start_mobile.sh <<'EOF'
 export OMBRE_GATEWAY_ADMIN_URL="http://127.0.0.1:8010/api/config"
+EOF
+  fi
+  cat >> start_mobile.sh <<'EOF'
 nohup "${PYTHON_CMD}" server.py > logs/ombre-brain.log 2>&1 &
 echo $! > state/ombre-brain.pid
+echo "Ombre-Brain started: http://127.0.0.1:8000/health"
+EOF
+  if [[ "${FEATURE_SCOPE}" == "full" ]]; then
+    cat >> start_mobile.sh <<'EOF'
 nohup "${PYTHON_CMD}" gateway.py > logs/ombre-gateway.log 2>&1 &
 echo $! > state/ombre-gateway.pid
-echo "Ombre-Brain started: http://127.0.0.1:8000/health"
 echo "Ombre-Gateway started: http://127.0.0.1:8010/health"
 EOF
+  fi
   chmod +x start_mobile.sh
 
   if prompt_yes_no '现在后台启动手机服务吗' 'y'; then
@@ -707,6 +772,7 @@ update_mobile_runtime() {
 
 doctor_mobile_runtime() {
   local python_cmd
+  local gateway_expected="false"
   line
   printf '手机部署错误排查\n'
 
@@ -728,7 +794,18 @@ doctor_mobile_runtime() {
     printf 'WARN config.yaml 不存在；请先走首次部署。\n'
   fi
 
-  for key in OMBRE_API_KEY OMBRE_EMBEDDING_API_KEY OMBRE_DREAM_API_KEY OMBRE_GATEWAY_TOKEN; do
+  if [[ -f "start_mobile.sh" ]] && grep -q "gateway.py" "start_mobile.sh"; then
+    gateway_expected="true"
+  fi
+
+  local keys=(OMBRE_API_KEY OMBRE_EMBEDDING_API_KEY OMBRE_DREAM_API_KEY)
+  if [[ "${gateway_expected}" == "true" ]]; then
+    keys+=(OMBRE_GATEWAY_TOKEN)
+  else
+    printf 'INFO 当前 start_mobile.sh 未启用 Gateway，跳过 Gateway token 检查。\n'
+  fi
+
+  for key in "${keys[@]}"; do
     if env_file_has_value "${key}"; then
       printf 'OK   %s 已配置\n' "${key}"
     else
@@ -748,16 +825,20 @@ doctor_mobile_runtime() {
     printf 'WARN 未找到 state/ombre-brain.pid；可能还没启动 start_mobile.sh。\n'
   fi
 
-  if [[ -f "state/ombre-gateway.pid" ]]; then
-    local gateway_pid
-    gateway_pid="$(cat state/ombre-gateway.pid 2>/dev/null || true)"
-    if [[ -n "${gateway_pid}" ]] && kill -0 "${gateway_pid}" >/dev/null 2>&1; then
-      printf 'OK   ombre-gateway 进程存在：%s\n' "${gateway_pid}"
+  if [[ "${gateway_expected}" == "true" ]]; then
+    if [[ -f "state/ombre-gateway.pid" ]]; then
+      local gateway_pid
+      gateway_pid="$(cat state/ombre-gateway.pid 2>/dev/null || true)"
+      if [[ -n "${gateway_pid}" ]] && kill -0 "${gateway_pid}" >/dev/null 2>&1; then
+        printf 'OK   ombre-gateway 进程存在：%s\n' "${gateway_pid}"
+      else
+        printf 'WARN ombre-gateway pid 文件存在，但进程可能没在跑。\n'
+      fi
     else
-      printf 'WARN ombre-gateway pid 文件存在，但进程可能没在跑。\n'
+      printf 'WARN 未找到 state/ombre-gateway.pid；可能还没启动 start_mobile.sh。\n'
     fi
   else
-    printf 'WARN 未找到 state/ombre-gateway.pid；可能还没启动 start_mobile.sh。\n'
+    printf 'INFO 当前手机部署未启用 Gateway，跳过 Gateway 进程检查。\n'
   fi
 
   if command -v curl >/dev/null 2>&1; then
@@ -766,16 +847,22 @@ doctor_mobile_runtime() {
     else
       printf 'WARN Ombre-Brain health 不通：http://127.0.0.1:8000/health\n'
     fi
-    if curl -fsS --max-time 5 "http://127.0.0.1:8010/health" >/dev/null 2>&1; then
-      printf 'OK   Gateway health 通：http://127.0.0.1:8010/health\n'
-    else
-      printf 'WARN Gateway health 不通：http://127.0.0.1:8010/health\n'
+    if [[ "${gateway_expected}" == "true" ]]; then
+      if curl -fsS --max-time 5 "http://127.0.0.1:8010/health" >/dev/null 2>&1; then
+        printf 'OK   Gateway health 通：http://127.0.0.1:8010/health\n'
+      else
+        printf 'WARN Gateway health 不通：http://127.0.0.1:8010/health\n'
+      fi
     fi
   else
     printf 'WARN 未找到 curl，跳过 health 检查。\n'
   fi
 
-  for log_file in logs/ombre-brain.log logs/ombre-gateway.log; do
+  local log_files=(logs/ombre-brain.log)
+  if [[ "${gateway_expected}" == "true" ]]; then
+    log_files+=(logs/ombre-gateway.log)
+  fi
+  for log_file in "${log_files[@]}"; do
     if [[ -f "${log_file}" ]]; then
       printf '\n最近日志：%s\n' "${log_file}"
       grep -Eai 'error|exception|traceback|401|403|429|500|502|503|504|connection refused|address already in use|api key|unauthorized|permission denied|timeout' "${log_file}" \
@@ -787,7 +874,11 @@ doctor_mobile_runtime() {
   done
 
   printf '\n手机客户端常用填写：\n'
-  printf '  Gateway Base URL: http://127.0.0.1:8010/v1\n'
+  if [[ "${gateway_expected}" == "true" ]]; then
+    printf '  Gateway Base URL: http://127.0.0.1:8010/v1\n'
+  else
+    printf '  Gateway Base URL: 未启用；请使用 MCP 工具模式\n'
+  fi
   printf '  MCP URL: http://127.0.0.1:8000/mcp\n'
   printf '  Dashboard: http://127.0.0.1:8000/dashboard\n'
 }
@@ -824,8 +915,9 @@ install_shortcut() {
 
 first_deploy() {
   choose_deploy_target
+  choose_feature_scope
   line
-  printf '当前选择：%s\n' "${DEPLOY_LABEL}"
+  printf '当前选择：%s / %s\n' "${DEPLOY_LABEL}" "${FEATURE_LABEL}"
   if [[ "${DEPLOY_TARGET}" == "mobile" ]]; then
     printf '首次部署会生成 .env、config.yaml 和 start_mobile.sh。\n'
   else
@@ -863,11 +955,16 @@ first_deploy() {
   fi
 
   local gateway_token
-  configure_gateway_upstreams "${dehy_base_url}" "${dehy_model}" "${dehy_key}"
-  gateway_token="$(prompt_secret 'Gateway 访问 token（回车自动生成）' false)"
-  if [[ -z "${gateway_token}" ]]; then
-    gateway_token="$(random_token)"
-    printf '已自动生成 OMBRE_GATEWAY_TOKEN。\n'
+  if [[ "${FEATURE_SCOPE}" == "full" ]]; then
+    configure_gateway_upstreams "${dehy_base_url}" "${dehy_model}" "${dehy_key}"
+    gateway_token="$(prompt_secret 'Gateway 访问 token（回车自动生成）' false)"
+    if [[ -z "${gateway_token}" ]]; then
+      gateway_token="$(random_token)"
+      printf '已自动生成 OMBRE_GATEWAY_TOKEN。\n'
+    fi
+  else
+    gateway_token=""
+    GATEWAY_UPSTREAMS_YAML="  upstreams: []"
   fi
 
   local dream_enabled dream_base_url dream_model dream_key dream_probability
@@ -897,10 +994,18 @@ first_deploy() {
   if [[ "${DEPLOY_TARGET}" == "mobile" ]]; then
     brain_port="${DEFAULT_BRAIN_PORT}"
     gateway_port="${DEFAULT_GATEWAY_PORT}"
-    printf '手机直跑使用固定端口：Ombre-Brain=%s，Gateway=%s。\n' "${brain_port}" "${gateway_port}"
+    if [[ "${FEATURE_SCOPE}" == "full" ]]; then
+      printf '手机直跑使用固定端口：Ombre-Brain=%s，Gateway=%s。\n' "${brain_port}" "${gateway_port}"
+    else
+      printf '手机直跑使用固定端口：Ombre-Brain=%s；Gateway 不启动。\n' "${brain_port}"
+    fi
   else
     brain_port="$(prompt_text 'Ombre-Brain 对外端口' "${DEFAULT_BRAIN_PORT}")"
-    gateway_port="$(prompt_text 'Gateway 对外端口' "${DEFAULT_GATEWAY_PORT}")"
+    if [[ "${FEATURE_SCOPE}" == "full" ]]; then
+      gateway_port="$(prompt_text 'Gateway 对外端口' "${DEFAULT_GATEWAY_PORT}")"
+    else
+      gateway_port="${DEFAULT_GATEWAY_PORT}"
+    fi
   fi
   choose_client_host
 
