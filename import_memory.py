@@ -25,6 +25,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import jieba
+from rapidfuzz import fuzz
+
 from utils import bucket_text_for_embedding, count_tokens_approx, now_iso
 
 logger = logging.getLogger("ombre_brain.import")
@@ -259,6 +262,24 @@ def detect_and_parse(raw_content: str, filename: str = "") -> list[dict]:
 
 _OVERLAP_CONTEXT_NOTICE = "[上下文提示] 以下是上一段结尾，只用于理解前后关系，请不要从这里单独提取记忆。"
 _CURRENT_SEGMENT_NOTICE = "[本段内容]"
+_IMPORT_DUPLICATE_SIMILARITY = 88.0
+
+
+def _normalize_import_text(text: str) -> str:
+    text = re.sub(r"\[\[([^\]]+)\]\]", r"\1", str(text or ""))
+    text = re.sub(r"[\s\u3000]+", "", text.lower())
+    return re.sub(r"[^0-9a-zA-Z_\u4e00-\u9fff]+", "", text)
+
+
+def _import_similarity_text(text: str) -> str:
+    text = re.sub(r"\[\[([^\]]+)\]\]", r"\1", str(text or "").lower())
+    text = re.sub(r"[^0-9a-zA-Z_\u4e00-\u9fff]+", " ", text)
+    return " ".join(token for token in jieba.lcut(text) if token.strip())
+
+
+def _import_content_hash(text: str) -> str:
+    normalized = _normalize_import_text(text)
+    return hashlib.sha256(normalized.encode()).hexdigest()
 
 
 def _tail_for_overlap(text: str, overlap_tokens: int) -> str:
@@ -545,6 +566,7 @@ class ImportEngine:
         self._paused = False
         self._running = False
         self._chunks: list[dict] = []
+        self._seen_import_hashes: set[str] = set()
 
     @property
     def is_running(self) -> bool:
@@ -574,6 +596,7 @@ class ImportEngine:
 
         self._running = True
         self._paused = False
+        self._seen_import_hashes = set()
 
         try:
             source_hash = hashlib.sha256(raw_content.encode()).hexdigest()[:16]
@@ -664,45 +687,23 @@ class ImportEngine:
         if not items:
             return
 
+        items = self._dedupe_extracted_items(items)
+        if not items:
+            return
+
         # --- Store each extracted memory ---
         for item in items:
             try:
                 should_preserve = preserve_raw or item.get("preserve_raw", False)
+                status = await self._merge_or_create_item(item, preserve_raw=should_preserve)
 
-                if should_preserve:
-                    # Raw mode: store original content without summarization
-                    bucket_id = await self.bucket_mgr.create(
-                        content=item["content"],
-                        tags=item.get("tags", []),
-                        importance=item.get("importance", 5),
-                        domain=item.get("domain", ["未分类"]),
-                        valence=item.get("valence", 0.5),
-                        arousal=item.get("arousal", 0.3),
-                        name=item.get("name"),
-                    )
-                    if self.embedding_engine:
-                        try:
-                            await self.embedding_engine.generate_and_store(
-                                bucket_id,
-                                bucket_text_for_embedding(
-                                    {
-                                        "id": bucket_id,
-                                        "content": item["content"],
-                                        "metadata": {"name": item.get("name")},
-                                    }
-                                ),
-                            )
-                        except Exception:
-                            pass
+                if status == "raw":
                     self.state.data["memories_raw"] += 1
                     self.state.data["memories_created"] += 1
+                elif status == "created":
+                    self.state.data["memories_created"] += 1
                 else:
-                    # Normal mode: go through merge-or-create pipeline
-                    is_merged = await self._merge_or_create_item(item)
-                    if is_merged:
-                        self.state.data["memories_merged"] += 1
-                    else:
-                        self.state.data["memories_created"] += 1
+                    self.state.data["memories_merged"] += 1
 
                 # Patch timestamp if available
                 if chunk.get("timestamp_start"):
@@ -779,8 +780,55 @@ class ImportEngine:
 
         return validated
 
-    async def _merge_or_create_item(self, item: dict) -> bool:
-        """Try to merge with existing bucket, or create new. Returns is_merged."""
+    def _dedupe_extracted_items(self, items: list[dict]) -> list[dict]:
+        deduped = []
+        for item in items:
+            content = str(item.get("content") or "")
+            if not _normalize_import_text(content):
+                continue
+            content_hash = _import_content_hash(content)
+            if content_hash in self._seen_import_hashes:
+                logger.info("Skipped duplicate import item in same run: %s", item.get("name", "?"))
+                continue
+            self._seen_import_hashes.add(content_hash)
+            deduped.append(item)
+        return deduped
+
+    async def _find_duplicate_bucket(self, content: str) -> dict | None:
+        normalized = _normalize_import_text(content)
+        if not normalized:
+            return None
+        similarity_text = _import_similarity_text(content)
+        try:
+            buckets = await self.bucket_mgr.list_all(include_archive=False)
+        except Exception as e:
+            logger.warning(f"Import duplicate scan failed: {e}")
+            return None
+
+        for bucket in buckets:
+            meta = bucket.get("metadata", {}) if isinstance(bucket, dict) else {}
+            if meta.get("type") == "feel":
+                continue
+            existing_content = str(bucket.get("content") or "")
+            existing_normalized = _normalize_import_text(existing_content)
+            if not existing_normalized:
+                continue
+            if normalized == existing_normalized:
+                return bucket
+            if min(len(normalized), len(existing_normalized)) >= 40 and (
+                normalized in existing_normalized or existing_normalized in normalized
+            ):
+                return bucket
+
+            existing_similarity_text = _import_similarity_text(existing_content)
+            if min(len(similarity_text), len(existing_similarity_text)) < 30:
+                continue
+            if fuzz.token_set_ratio(similarity_text, existing_similarity_text) >= _IMPORT_DUPLICATE_SIMILARITY:
+                return bucket
+        return None
+
+    async def _merge_or_create_item(self, item: dict, preserve_raw: bool = False) -> str:
+        """Try to merge with existing bucket, or create new. Returns created/merged/raw/duplicate."""
         content = item["content"]
         domain = item.get("domain", ["未分类"])
         tags = item.get("tags", [])
@@ -788,6 +836,41 @@ class ImportEngine:
         valence = item.get("valence", 0.5)
         arousal = item.get("arousal", 0.3)
         name = item.get("name", "")
+
+        duplicate = await self._find_duplicate_bucket(content)
+        if duplicate:
+            logger.info(
+                "Skipped duplicate import item: %s -> %s",
+                name or "?",
+                duplicate.get("id", "?"),
+            )
+            return "duplicate"
+
+        if preserve_raw:
+            bucket_id = await self.bucket_mgr.create(
+                content=content,
+                tags=tags,
+                importance=importance,
+                domain=domain,
+                valence=valence,
+                arousal=arousal,
+                name=name or None,
+            )
+            if self.embedding_engine:
+                try:
+                    await self.embedding_engine.generate_and_store(
+                        bucket_id,
+                        bucket_text_for_embedding(
+                            {
+                                "id": bucket_id,
+                                "content": content,
+                                "metadata": {"name": name},
+                            }
+                        ),
+                    )
+                except Exception:
+                    pass
+            return "raw"
 
         try:
             existing = await self.bucket_mgr.search(
@@ -830,7 +913,7 @@ class ImportEngine:
                             )
                         except Exception:
                             pass
-                    return True
+                    return "merged"
                 except Exception as e:
                     logger.warning(f"Merge failed during import: {e}")
                     self.state.data["api_calls"] += 1
@@ -859,7 +942,7 @@ class ImportEngine:
                 )
             except Exception:
                 pass
-        return False
+        return "created"
 
     async def detect_patterns(self) -> list[dict]:
         """

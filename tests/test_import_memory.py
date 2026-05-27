@@ -1,5 +1,15 @@
+import pytest
+
 from import_memory import IMPORT_EXTRACT_PROMPT, ImportEngine, chunk_turns, detect_and_parse
 from utils import count_tokens_approx
+
+
+class DummyDehydrator:
+    api_available = True
+    model = "dummy"
+
+    async def merge(self, old_content: str, new_content: str) -> str:
+        return f"{old_content}\n{new_content}"
 
 
 def test_markdown_parser_supports_chinese_role_prefixes():
@@ -94,3 +104,87 @@ def test_import_extraction_output_budget_supports_ten_items():
     asyncio.run(engine._extract_memories("hello"))
 
     assert DummyClient.kwargs["max_tokens"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_import_dedupes_existing_bucket_by_content(test_config, bucket_mgr):
+    content = "小雨决定周末去杭州参加朋友婚礼，需要提前买高铁票并准备蓝色连衣裙。"
+    await bucket_mgr.create(
+        content=content,
+        name="婚礼安排",
+        domain=["人际"],
+        tags=["婚礼", "杭州"],
+    )
+    engine = ImportEngine(test_config, bucket_mgr, DummyDehydrator())
+
+    status = await engine._merge_or_create_item(
+        {
+            "name": "出行计划",
+            "content": content,
+            "domain": ["事务"],
+            "tags": ["高铁", "连衣裙"],
+            "importance": 6,
+        }
+    )
+
+    buckets = await bucket_mgr.list_all(include_archive=False)
+    assert status == "duplicate"
+    assert len(buckets) == 1
+
+
+@pytest.mark.asyncio
+async def test_import_dedupes_existing_bucket_by_similar_body(test_config, bucket_mgr):
+    await bucket_mgr.create(
+        content="小雨决定周末去杭州参加朋友婚礼，需要提前买高铁票并准备蓝色连衣裙。",
+        name="婚礼安排",
+        domain=["人际"],
+        tags=["婚礼", "杭州"],
+    )
+    engine = ImportEngine(test_config, bucket_mgr, DummyDehydrator())
+
+    status = await engine._merge_or_create_item(
+        {
+            "name": "杭州待办",
+            "content": "周末小雨要去杭州参加朋友的婚礼，她需要提前订高铁票，也想带上蓝色连衣裙。",
+            "domain": ["事务"],
+            "tags": ["高铁", "待办"],
+            "importance": 6,
+        }
+    )
+
+    buckets = await bucket_mgr.list_all(include_archive=False)
+    assert status == "duplicate"
+    assert len(buckets) == 1
+
+
+@pytest.mark.asyncio
+async def test_import_preserve_raw_still_dedupes(test_config, bucket_mgr):
+    engine = ImportEngine(test_config, bucket_mgr, DummyDehydrator())
+    item = {
+        "name": "暗号",
+        "content": "小雨说某个特殊暗号只属于她和 Haven，要保留原话。",
+        "domain": ["恋爱"],
+        "tags": ["暗号"],
+        "importance": 8,
+    }
+
+    first_status = await engine._merge_or_create_item(item, preserve_raw=True)
+    second_status = await engine._merge_or_create_item({**item, "name": "重复暗号"}, preserve_raw=True)
+
+    buckets = await bucket_mgr.list_all(include_archive=False)
+    assert first_status == "raw"
+    assert second_status == "duplicate"
+    assert len(buckets) == 1
+
+
+def test_import_dedupes_items_inside_same_extraction_batch(test_config, bucket_mgr):
+    engine = ImportEngine(test_config, bucket_mgr, DummyDehydrator())
+    items = [
+        {"name": "A", "content": "同一条导入记忆。"},
+        {"name": "B", "content": "同一条导入记忆。"},
+        {"name": "C", "content": "另一条导入记忆。"},
+    ]
+
+    deduped = engine._dedupe_extracted_items(items)
+
+    assert [item["name"] for item in deduped] == ["A", "C"]
