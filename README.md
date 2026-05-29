@@ -214,6 +214,7 @@ OMBRE_CHATGPT_OAUTH_CLIENT_SECRET=
 OMBRE_CHATGPT_OAUTH_ACCESS_TOKEN=
 OMBRE_CHATGPT_OAUTH_REFRESH_TOKEN=
 OMBRE_CHATGPT_OAUTH_PUBLIC_BASE_URL=
+OMBRE_CHATGPT_OAUTH_REDIRECT_URIS=https://claude.ai/api/mcp/auth_callback
 ```
 
 `MCP_BEARER_TOKEN` 只在接 RiJi/Haven-diary 摘记时需要；不接外部日记系统就不要配置 diary URL/token。
@@ -558,7 +559,7 @@ Local MCP: http://<host>:18001/mcp
 Dashboard: http://<host>:18001/dashboard
 ```
 
-如果使用 ChatGPT Connector OAuth，需要配置：
+如果使用 ChatGPT / Claude 远程 Connector OAuth，需要配置：
 
 ```text
 MCP server URL: https://<domain>/ombre/mcp
@@ -566,8 +567,11 @@ Authentication: OAuth
 Authorization URL: https://<domain>/ombre/oauth/authorize
 Token URL: https://<domain>/ombre/oauth/token
 Token endpoint auth method: client_secret_post
+OAuth Client ID/Secret: 使用 OMBRE_CHATGPT_OAUTH_CLIENT_ID / OMBRE_CHATGPT_OAUTH_CLIENT_SECRET
 Scopes: 留空
 ```
+
+默认允许 ChatGPT connector 回调和 Claude hosted connector 回调。Claude 网页远程 connector 的回调地址是 `https://claude.ai/api/mcp/auth_callback`；如需覆盖，设置 `OMBRE_CHATGPT_OAUTH_REDIRECT_URIS` 为逗号分隔的精确回调地址列表。
 
 ### Dashboard 登录
 

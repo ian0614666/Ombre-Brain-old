@@ -141,6 +141,10 @@ async def _hot_update_gateway_config(gateway_body: dict) -> str | None:
         return f"gateway_hot_reload_failed:{type(exc).__name__}"
 
 
+DEFAULT_CHATGPT_OAUTH_REDIRECT_PREFIX = "https://chatgpt.com/connector/oauth/"
+DEFAULT_CLAUDE_OAUTH_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback"
+
+
 class ChatGptOAuthProvider:
     def __init__(
         self,
@@ -149,7 +153,8 @@ class ChatGptOAuthProvider:
         access_token: str = "",
         refresh_token: str = "",
         public_base_url: str = "",
-        redirect_prefix: str = "https://chatgpt.com/connector/oauth/",
+        redirect_prefix: str = DEFAULT_CHATGPT_OAUTH_REDIRECT_PREFIX,
+        redirect_uris: list[str] | None = None,
         token_ttl_seconds: int = 30 * 24 * 60 * 60,
     ) -> None:
         self.client_id = client_id.strip()
@@ -158,6 +163,16 @@ class ChatGptOAuthProvider:
         self.refresh_token = refresh_token.strip()
         self.public_base_url = public_base_url.strip().rstrip("/")
         self.redirect_prefix = redirect_prefix.strip()
+        raw_redirect_uris = (
+            [DEFAULT_CLAUDE_OAUTH_REDIRECT_URI]
+            if redirect_uris is None
+            else redirect_uris
+        )
+        self.redirect_uris = tuple(
+            uri.strip()
+            for uri in raw_redirect_uris
+            if uri.strip()
+        )
         self.token_ttl_seconds = token_ttl_seconds
         self._codes: dict[str, tuple[str, float]] = {}
 
@@ -187,7 +202,10 @@ class ChatGptOAuthProvider:
         return bool(client_secret) and hmac.compare_digest(client_secret, self.client_secret)
 
     def valid_redirect_uri(self, redirect_uri: str | None) -> bool:
-        return bool(redirect_uri) and redirect_uri.startswith(self.redirect_prefix)
+        return bool(redirect_uri) and (
+            bool(self.redirect_prefix and redirect_uri.startswith(self.redirect_prefix))
+            or redirect_uri in self.redirect_uris
+        )
 
     def create_authorization_code(self, redirect_uri: str) -> str:
         code = secrets.token_urlsafe(32)
@@ -220,7 +238,16 @@ OMBRE_CHATGPT_OAUTH = ChatGptOAuthProvider(
     access_token=os.environ.get("OMBRE_CHATGPT_OAUTH_ACCESS_TOKEN", ""),
     refresh_token=os.environ.get("OMBRE_CHATGPT_OAUTH_REFRESH_TOKEN", ""),
     public_base_url=os.environ.get("OMBRE_CHATGPT_OAUTH_PUBLIC_BASE_URL", ""),
-    redirect_prefix=os.environ.get("OMBRE_CHATGPT_OAUTH_REDIRECT_PREFIX", "https://chatgpt.com/connector/oauth/"),
+    redirect_prefix=os.environ.get(
+        "OMBRE_CHATGPT_OAUTH_REDIRECT_PREFIX",
+        DEFAULT_CHATGPT_OAUTH_REDIRECT_PREFIX,
+    ),
+    redirect_uris=_split_csv(
+        os.environ.get(
+            "OMBRE_CHATGPT_OAUTH_REDIRECT_URIS",
+            DEFAULT_CLAUDE_OAUTH_REDIRECT_URI,
+        )
+    ),
     token_ttl_seconds=_int_env("OMBRE_CHATGPT_OAUTH_TOKEN_TTL_SECONDS", 30 * 24 * 60 * 60),
 )
 

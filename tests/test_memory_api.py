@@ -1133,6 +1133,9 @@ def test_chatgpt_oauth_provider_issues_single_use_codes():
 
     assert provider.enabled is True
     assert provider.token_auth_methods == ["client_secret_post", "client_secret_basic"]
+    assert provider.valid_redirect_uri("https://chatgpt.com/connector/oauth/test") is True
+    assert provider.valid_redirect_uri("https://claude.ai/api/mcp/auth_callback") is True
+    assert provider.valid_redirect_uri("https://example.com/oauth/callback") is False
     assert provider.consume_authorization_code(code, redirect_uri) is True
     assert provider.consume_authorization_code(code, redirect_uri) is False
     assert provider.valid_access_token("access") is True
