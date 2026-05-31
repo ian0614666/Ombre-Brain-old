@@ -31,13 +31,13 @@ log_level: "INFO"
 # when adapting the fork for another person/persona.
 # 这些名字会进入提示词和年轮作者。改给别人用时优先改这一块。
 identity:
-  ai_name: "Haven"              # MCP-authored year rings and assistant wording
-  user_name: "Rain"             # Dashboard-authored year rings
-  user_display_name: "小雨"      # How prompts refer to the human partner
+  ai_name: "克"              # MCP-authored year rings and assistant wording
+  user_name: "涵涵"             # Dashboard-authored year rings
+  user_display_name: "涵涵"      # How prompts refer to the human partner
   user_aliases:
     - "宝宝"
-    - "老婆"
-    - "亲爱的"
+    - "乖乖"
+    - "心心"
     - "她"
 
 # --- Merge threshold / 桶合并阈值 ---
